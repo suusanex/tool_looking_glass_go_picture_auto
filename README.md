@@ -30,7 +30,7 @@ uv run lookgo.py show --list "C:\Images\playlist.txt" --interval 15
 
 詳細は公式の [Go トラブルシューティング](https://lfdocs.lookingglassfactory.com/getting-started/looking-glass-go/troubleshooting) と [Windows のディスプレイ設定](https://lfdocs.lookingglassfactory.com/software/looking-glass-bridge/display-settings-on-windows) を参照してください。USB-C ケーブル接続では PC 側の DisplayPort Alt Mode 対応を確認してください。公式資料では Go 用 HDMI adapter も案内されています。
 
-画像の表示には、インストール済みで起動中の Looking Glass Bridge が `http://127.0.0.1:33334` で提供するローカル REST API を使います。Bridge Python SDK の native DLL は、同梱版 2.6.2 と公式配布版 2.6.3 の両方で初期化前にプロセスを終了させることを確認したため、表示経路には使いません。公式の [Bridge.js](https://github.com/Looking-Glass/bridge.js) の API 利用方法を参考にしています。表示には playlist 再生の開始に加えて `show_window(true)` が必要で、Go 本体も Desktop Mode で起動している必要があります。これらを満たして表示した既知の RGBD テストパターン（赤・緑・青の帯と白い円）は実機で確認済みです。RGB が左、深度が右となる `depth_loc=2` の配置も確認済みです。
+画像の表示には、インストール済みで起動中の Looking Glass Bridge が `http://127.0.0.1:33334` で提供するローカル REST API を使います。Bridge Python SDK の native DLL は、同梱版 2.6.2 と公式配布版 2.6.3 の両方で初期化前にプロセスを終了させることを確認したため、表示経路には使いません。公式の [Bridge.js](https://github.com/Looking-Glass/bridge.js) の API 利用方法を参考にしています。表示には playlist 再生の開始に加えて `show_window(true)` が必要で、Go 本体も Desktop Mode で起動している必要があります。`show_window(true)` は、Bridge のログに対象画像の `Showing` が出てから送ります。`play_playlist` の応答も `New Item Playing` も、そのプロセスで最初の OpenGL 初期化より先に届きます。初期化中に `show_window` を送ると REST が応答しなくなり、Bridge を再起動するまで接続できません。これらを満たして表示した既知の RGBD テストパターン（赤・緑・青の帯と白い円）は実機で確認済みです。RGB が左、深度が右となる `depth_loc=2` の配置も確認済みです。
 
 ## 初回起動と GPU / CPU
 
@@ -98,7 +98,7 @@ uv run lookgo.py _test -q
 
 ## 表示確認状況
 
-Bridge REST API と既知の RGBD テストパターンによる物理表示、`depth_loc=2` の RGB 左・深度右の配置は実機で確認済みです。深度推定モデルの CUDA 推論も確認済みです。以下の lookgo CLI による動作は、実機で未確認です。
+Bridge REST API と既知の RGBD テストパターンによる物理表示、`depth_loc=2` の RGB 左・深度右の配置は実機で確認済みです。深度推定モデルの CUDA 推論も確認済みです。起動直後の Bridge で既存の RGBD キャッシュを表示し、ログの `Showing` の後に `show_window` を送っても REST が応答し続けることは確認済みです。以下の lookgo CLI による動作は、実機で未確認です。
 
 - 写真とイラストで奥行き方向が意図どおりか確認する。
 - A/B/C のリストを表示し、複数周の切替順が A→B→C→A になることを確認する。
