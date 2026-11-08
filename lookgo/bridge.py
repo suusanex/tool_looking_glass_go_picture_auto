@@ -65,7 +65,8 @@ class RestBridge:
         status = response.get("status")
         status_name = status.get("name") if isinstance(status, dict) else None
         status_value = status.get("value") if isinstance(status, dict) else None
-        if status_value != "Completion":
+        # Bridge.js の sendMessage は Completion と Pending を失敗にしない。Pending は非同期受付。
+        if status_value not in {"Completion", "Pending"}:
             raise RuntimeError(
                 f"Bridge request {endpoint} returned status {status_value!r} "
                 f"({status_name or 'unnamed'}): {response}"

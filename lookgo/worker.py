@@ -341,6 +341,7 @@ class DisplayWorker:
                 except (OSError, EOFError):
                     connection.close()
                     connected = False
+                    continue
             retained.append((item_generation, connection))
         for item in retained:
             self.pending.put(item)
