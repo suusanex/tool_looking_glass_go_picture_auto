@@ -70,8 +70,13 @@ def test_connect_checks_bridge_version_and_selects_go_by_hardware_type(monkeypat
     assert requests[0] == ("GET", "", None)
 
 
-@pytest.mark.parametrize("status", ["Pending", "Failure", "UnknownOrchestration"])
-def test_only_completion_is_accepted(status: str):
+@pytest.mark.parametrize("status", ["Completion", "Pending"])
+def test_completion_and_pending_are_accepted(status: str):
+    RestBridge._completion(response("play_playlist", wrap("payload", {}), status), "play_playlist")
+
+
+@pytest.mark.parametrize("status", ["Failure", "UnknownOrchestration"])
+def test_failure_statuses_are_rejected(status: str):
     with pytest.raises(RuntimeError, match=status):
         RestBridge._completion(response("play_playlist", wrap("payload", {}), status), "play_playlist")
 

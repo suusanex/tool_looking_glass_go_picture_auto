@@ -27,6 +27,11 @@ class FakeConnection:
         self.closed = True
 
 
+class DisconnectedConnection(FakeConnection):
+    def poll(self, _timeout: float = 0.0) -> bool:
+        raise EOFError("client gone")
+
+
 class InlineThread:
     """変換スレッドの開始点を保ちつつ、準備処理を決定的に実行する。"""
 
@@ -295,6 +300,25 @@ def test_cancel_after_client_timeout_prevents_late_commit(monkeypatch, tmp_path)
     assert show_connection.responses[0]["ok"] is False
     assert worker.active_sources == old
     assert worker.interval == 9
+
+
+def test_disconnected_show_client_is_not_requeued(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    image = tmp_path / "image.png"
+    write_image(image, (1, 2, 3))
+    cache_images(worker, [image])
+    playlist = tmp_path / "list.txt"
+    write_playlist(playlist, [image])
+    submit_show(worker, playlist)
+
+    disconnected = DisconnectedConnection()
+    generation, _connection = worker.pending.get_nowait()
+    worker.pending.put((generation, disconnected))
+    worker._pump()
+
+    assert worker.active_sources == []
+    assert worker.pending.empty()
+    assert disconnected.closed is True
 
 
 def test_single_image_stays_fixed_and_multiple_images_wrap(monkeypatch, tmp_path):
