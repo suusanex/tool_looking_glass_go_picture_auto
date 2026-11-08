@@ -3,13 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import time
 import urllib.error
 import urllib.request
 import uuid
 
 from .settings import DEPTHINESS, DEPTH_LOCATION, FOCUS
+
+# 対象画像は競合がなければ 1 秒未満で Showing になる。出なければ表示せず止める。
+_PLAYBACK_START_TIMEOUT = 30.0
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,8 @@ class RestBridge:
         self.device: DisplayDevice | None = None
         self.active_playlist: str | None = None
         self.owned_playlists: set[str] = set()
+        # show_window(true) が成功するまで False。未表示の間は close でも隠さない。
+        self.window_shown = False
 
     def _http(self, method: str, endpoint: str = "", body: dict | None = None) -> dict | None:
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -190,12 +197,19 @@ class RestBridge:
             "depthiness": DEPTHINESS,
             "zoom": 1,
         })
+        # play_playlist の HTTP 応答も New Item Playing も、そのプロセスで最初の OpenGL 初期化より先に届く。
+        # 初期化中の show_window は REST を止めて、再起動まで GET / もタイムアウトさせる。
+        # Bridge ログに Showing が出てから表示する。出ないときは show_window を送らない。
+        log_path = _current_bridge_log()
+        log_offset = log_path.stat().st_size
         self._put("play_playlist", {**playlist, "head_index": self.device.index})
+        _wait_until_showing(log_path, log_offset, image_path.name, _PLAYBACK_START_TIMEOUT)
         self._put("show_window", {
             "orchestration": self.orchestration,
             "show_window": True,
             "head_index": self.device.index,
         })
+        self.window_shown = True
 
         previous = self.active_playlist
         self.active_playlist = name
@@ -215,7 +229,8 @@ class RestBridge:
     def close(self) -> None:
         errors: list[Exception] = []
         if self.orchestration:
-            if self.device:
+            # 再生開始前の show_window(false) も初回 OpenGL 初期化と衝突して REST を止める。
+            if self.device and self.window_shown:
                 try:
                     self._put("show_window", {
                         "orchestration": self.orchestration,
@@ -235,5 +250,46 @@ class RestBridge:
                 errors.append(exc)
         self.orchestration = None
         self.device = None
+        self.window_shown = False
         if errors:
             raise RuntimeError("Bridge cleanup failed: " + "; ".join(map(str, errors)))
+
+
+def _current_bridge_log() -> Path:
+    appdata = os.environ.get("APPDATA")
+    root = Path(appdata) / "Looking Glass" if appdata else None
+    logs = list(root.glob("Bridge */logs/Looking Glass Bridge *.log")) if root else []
+    if not logs:
+        raise RuntimeError("Looking Glass Bridge log was not found; show_window was not sent")
+    return max(logs, key=lambda path: path.stat().st_mtime)
+
+
+def _wait_until_showing(log_path: Path, start_offset: int, file_name: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    offset = start_offset
+    pending = b""
+    name = file_name.encode("utf-8")
+    logging.info("Waiting until Bridge shows %s before show_window", file_name)
+    while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Bridge did not show {file_name} within {timeout:.0f}s; show_window was not sent"
+            )
+        try:
+            size = log_path.stat().st_size
+            if size < offset:
+                offset = 0
+                pending = b""
+            if size > offset:
+                with log_path.open("rb") as handle:
+                    handle.seek(offset)
+                    pending += handle.read(size - offset)
+                offset = size
+        except OSError as exc:
+            raise RuntimeError(f"Cannot read Looking Glass Bridge log {log_path}: {exc}") from exc
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if b"Showing " in line and name in line:
+                logging.info("Bridge is showing %s", file_name)
+                return
+        time.sleep(0.05)

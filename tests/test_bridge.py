@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
-from lookgo.bridge import DisplayDevice, RestBridge
+from lookgo.bridge import DisplayDevice, RestBridge, _current_bridge_log, _wait_until_showing
 
 
 def wrap(name: str, value, kind: str = "WSTRING") -> dict:
@@ -88,23 +90,30 @@ def test_present_creates_and_plays_new_playlist_before_deleting_old(tmp_path: Pa
     renderer.active_playlist = "lookgo-old"
     renderer.owned_playlists.add("lookgo-old")
     monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"Showing older.png for 1 ms\n")
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
     calls = []
+    image = tmp_path / "RGBD 日本語.png"
+    image.write_bytes(b"file")
 
     def fake_put(endpoint: str, body: dict):
         calls.append((endpoint, body))
+        if endpoint == "play_playlist":
+            with log_path.open("ab") as handle:
+                handle.write(f"Loading {image.name}\nShowing {image.name} for 10000 ms\n".encode())
         if endpoint == "available_output_devices":
             return available_devices()
         return response(endpoint, wrap("payload", {}))
 
     monkeypatch.setattr(renderer, "_put", fake_put)
-    image = tmp_path / "RGBD 日本語.png"
-    image.write_bytes(b"file")
     name = renderer.present(image, duration_ms=15_000)
 
     assert name.startswith("lookgo-")
     assert [endpoint for endpoint, _ in calls] == [
         "instance_playlist", "insert_playlist_entry", "play_playlist", "show_window", "delete_playlist"
     ]
+    assert renderer.window_shown is True
     insert = calls[1][1]
     assert insert["uri"] == str(image.resolve())
     assert insert["id"] == 0 and insert["index"] == 0
@@ -124,6 +133,9 @@ def test_present_failure_does_not_delete_previous_playlist(tmp_path: Path, monke
     renderer.active_playlist = "lookgo-old"
     renderer.owned_playlists.add("lookgo-old")
     monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"")
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
 
     def fail_play(endpoint: str, _body: dict):
         if endpoint == "play_playlist":
@@ -135,6 +147,57 @@ def test_present_failure_does_not_delete_previous_playlist(tmp_path: Path, monke
         renderer.present(tmp_path / "image.png", duration_ms=10_000)
     assert renderer.active_playlist == "lookgo-old"
     assert "lookgo-old" in renderer.owned_playlists
+    assert renderer.window_shown is False
+
+
+def test_present_does_not_show_window_before_bridge_shows_the_image(tmp_path: Path, monkeypatch):
+    renderer = RestBridge()
+    renderer.orchestration = "{orch}"
+    renderer.device = DisplayDevice(2, "LKG-E04851", 0.5625, 6, 11, 66)
+    monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    monkeypatch.setattr("lookgo.bridge._PLAYBACK_START_TIMEOUT", 0.15)
+    log_path = tmp_path / "bridge.log"
+    image = tmp_path / "image.png"
+    image.write_bytes(b"file")
+    log_path.write_bytes(f"Showing {image.name} for 1 ms\nLoading {image.name}\n".encode())
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+    order = []
+
+    def fake_put(endpoint: str, _body: dict):
+        order.append(endpoint)
+        return response(endpoint, wrap("payload", {}))
+
+    monkeypatch.setattr(renderer, "_put", fake_put)
+    with pytest.raises(RuntimeError, match="show_window was not sent"):
+        renderer.present(image, duration_ms=10_000)
+    assert order == ["instance_playlist", "insert_playlist_entry", "play_playlist"]
+    assert renderer.window_shown is False
+
+
+def test_wait_until_showing_ignores_loading_and_older_lines(tmp_path: Path):
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"Showing target.png for 1 ms\n")
+    offset = log_path.stat().st_size
+    with log_path.open("ab") as handle:
+        handle.write(b"Loading target.png with duration\nShowing other.png for 1 ms\n")
+
+    def append_showing():
+        time.sleep(0.15)
+        with log_path.open("ab") as handle:
+            handle.write(b"Showing target.png for 10000 ms\n")
+
+    thread = threading.Thread(target=append_showing)
+    thread.start()
+    try:
+        _wait_until_showing(log_path, offset, "target.png", timeout=2)
+    finally:
+        thread.join(2)
+
+
+def test_missing_bridge_log_is_reported(monkeypatch):
+    monkeypatch.delenv("APPDATA", raising=False)
+    with pytest.raises(RuntimeError, match="log was not found"):
+        _current_bridge_log()
 
 
 def test_close_hides_go_deletes_only_owned_playlists_and_exits(monkeypatch):
@@ -143,6 +206,7 @@ def test_close_hides_go_deletes_only_owned_playlists_and_exits(monkeypatch):
     renderer.device = DisplayDevice(2, "LKG-E04851", 0.5625, 6, 11, 66)
     renderer.active_playlist = "lookgo-owned"
     renderer.owned_playlists = {"lookgo-owned", "lookgo-staging"}
+    renderer.window_shown = True
     calls = []
     monkeypatch.setattr(renderer, "_put", lambda endpoint, body: calls.append((endpoint, body)) or response(endpoint, wrap("payload", {})))
 
@@ -152,6 +216,21 @@ def test_close_hides_go_deletes_only_owned_playlists_and_exits(monkeypatch):
     assert [endpoint for endpoint, _ in calls].count("delete_playlist") == 2
     assert calls[-1] == ("exit_orchestration", {"orchestration": "{orch}"})
     assert renderer.orchestration is None
+    assert renderer.window_shown is False
+
+
+def test_close_before_playback_does_not_send_show_window(monkeypatch):
+    renderer = RestBridge()
+    renderer.orchestration = "{orch}"
+    renderer.device = DisplayDevice(2, "LKG-E04851", 0.5625, 6, 11, 66)
+    renderer.owned_playlists = {"lookgo-staging"}
+    calls = []
+    monkeypatch.setattr(renderer, "_put", lambda endpoint, body: calls.append((endpoint, body)) or response(endpoint, wrap("payload", {})))
+
+    renderer.close()
+
+    assert [endpoint for endpoint, _ in calls] == ["delete_playlist", "exit_orchestration"]
+    assert renderer.window_shown is False
 
 
 def test_http_uses_utf8_json_put_body(monkeypatch):
