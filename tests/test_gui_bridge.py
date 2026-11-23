@@ -45,6 +45,8 @@ def test_bridge_emits_ready_and_falls_back_when_worker_stopped(monkeypatch):
     state = status_resp["state"]
     assert state["status"] == "stopped"
     assert state["last_status"] == "playing"
+    assert state["images"] == []
+    assert state["index"] is None
     assert state["worker_running"] is False
     assert state["busy"] is False
     assert state["paused"] is False

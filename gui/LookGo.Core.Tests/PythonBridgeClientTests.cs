@@ -272,6 +272,64 @@ raise SystemExit(gui_bridge.gui_bridge_entry())
         Assert.NotNull(status.State);
         Assert.False(status.State!.WorkerRunning);
         Assert.Equal("stopped", status.State.Status);
+        Assert.Empty(status.State.Images);
+        Assert.Null(status.State.Index);
+    }
+
+    [Fact]
+    public async Task HungBridgeStartup_KillsAndDisposesOrphanedChildProcessBeforeReturningError()
+    {
+        var pidFile = Path.Combine(_tempDir, "hung.pid");
+        var hungScript = Path.Combine(_tempDir, "hung_bridge.py");
+        File.WriteAllText(hungScript, """
+import os
+from pathlib import Path
+import sys
+import time
+
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(60)
+""", new UTF8Encoding(false));
+
+        await using var client = new PythonBridgeClient(
+            _tempDir,
+            executable: "uv",
+            baseArguments: ["run", "--no-sync", "--python", "3.12", "python", hungScript, pidFile],
+            readyTimeout: TimeSpan.FromMilliseconds(1500));
+
+        var result = await client.GetStatusAsync();
+        Assert.False(result.Ok);
+        Assert.Contains("Timed out", result.Error ?? "");
+
+        Assert.True(File.Exists(pidFile));
+        var pid = int.Parse(File.ReadAllText(pidFile, Encoding.UTF8).Trim());
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var proc = System.Diagnostics.Process.GetProcessById(pid);
+                if (proc.HasExited)
+                    break;
+            }
+            catch (ArgumentException)
+            {
+                break;
+            }
+            await Task.Delay(50);
+        }
+
+        var stillAlive = false;
+        try
+        {
+            using var check = System.Diagnostics.Process.GetProcessById(pid);
+            stillAlive = !check.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            stillAlive = false;
+        }
+        Assert.False(stillAlive);
     }
 
     private static string? FindRepoRoot()
