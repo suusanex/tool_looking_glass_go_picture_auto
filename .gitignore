@@ -220,3 +220,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# .NET / WinUI 3
+bin/
+obj/
+.vs/
+TestResults/
+*.user

@@ -15,16 +15,31 @@ import threading
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Client, Listener
+import uuid
 
 from filelock import FileLock, Timeout
 from PIL import Image
 
 from .bridge import LoadingCursor, PlaylistRejected, RestBridge
 from .imaging import DepthEstimator, cache_key, convert_to_rgbd
-from .playlist import read_playlist_entries
+from .playlist import PlaylistError, read_playlist_entries_from_bytes
 from .settings import (
     APP_NAME, MAX_IMAGE_EDGE, cache_directory, data_directory, log_path, state_path,
 )
+
+
+_DEFAULT_STATE = {
+    "status": "stopped",
+    "images": [],
+    "index": None,
+    "busy": False,
+    "last_error": None,
+    "paused": False,
+    "interval": 10.0,
+    "list_path": None,
+    "active_operation_id": None,
+    "active_list_sha256": None,
+}
 
 
 def pipe_address() -> str:
@@ -40,9 +55,12 @@ def _write_json_atomic(path: Path, value: dict) -> None:
 
 def _read_state() -> dict:
     try:
-        return json.loads(state_path().read_text(encoding="utf-8"))
+        loaded = json.loads(state_path().read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return {**_DEFAULT_STATE, **loaded}
     except (OSError, json.JSONDecodeError):
-        return {"status": "stopped", "images": [], "index": None}
+        pass
+    return dict(_DEFAULT_STATE)
 
 
 def _send_response(connection, value: dict) -> None:
@@ -84,9 +102,15 @@ class DisplayWorker:
         self.pending_sources: dict[int, list[Path]] = {}
         self.pending_intervals: dict[int, float] = {}
         self.pending_operations: dict[int, str] = {}
+        self.pending_list_paths: dict[int, str] = {}
+        self.pending_list_digests: dict[int, str] = {}
         self.cancelled_generations: set[int] = set()
         self.index: int | None = 0
         self.interval = 10.0
+        self.paused = False
+        self.list_path: str | None = None
+        self.active_operation_id: str | None = None
+        self.active_list_sha256: str | None = None
         self.last_change = time.monotonic()
         self.playback_cursor: LoadingCursor | None = None
         self.generation = 0
@@ -94,14 +118,147 @@ class DisplayWorker:
         self.stopping = False
         self.last_error = None
 
-    def _save_state(self, status: str) -> None:
-        _write_json_atomic(state_path(), {
-            "status": status,
+    def _current_status(self) -> str:
+        if self.stopping:
+            return "error" if self.last_error else "stopped"
+        if self.busy:
+            return "updating"
+        if self.active:
+            return "paused" if self.paused else "playing"
+        if self.last_error:
+            return "error"
+        return "idle"
+
+    def _snapshot_state(self, status_override: str | None = None) -> dict:
+        has_active = bool(self.active)
+        return {
+            "status": status_override or self._current_status(),
             "images": [str(path) for path in self.active_sources],
-            "index": self.index if self.active else None,
+            "index": self.index if has_active else None,
             "busy": self.busy,
             "last_error": self.last_error,
-        })
+            "paused": self.paused if has_active else False,
+            "interval": self.interval,
+            "list_path": self.list_path,
+            "active_operation_id": self.active_operation_id if has_active else None,
+            "active_list_sha256": self.active_list_sha256 if has_active else None,
+        }
+
+    def _save_state(self, status: str | None = None) -> None:
+        _write_json_atomic(state_path(), self._snapshot_state(status))
+
+    def _cleanup_pending(self, generation: int) -> None:
+        self.pending_sources.pop(generation, None)
+        self.pending_intervals.pop(generation, None)
+        self.pending_operations.pop(generation, None)
+        self.pending_list_paths.pop(generation, None)
+        self.pending_list_digests.pop(generation, None)
+
+    def _attach_loading_cursor(self, expected_index: int | None = None, *, from_seek: bool = False) -> None:
+        self.playback_cursor = None
+        if len(self.active) <= 1:
+            return
+        start_offset = getattr(self.renderer, "playback_log_offset", None)
+        if from_seek:
+            assert expected_index is not None
+            cursor_expected = expected_index if start_offset is not None else (expected_index + 1) % len(self.active)
+            try:
+                self.playback_cursor = LoadingCursor(
+                    [path.name for path in self.active],
+                    start_offset=start_offset,
+                    expected_index=cursor_expected,
+                    awaiting_seek=start_offset is not None,
+                )
+            except Exception:
+                logging.warning(
+                    "Bridge log could not be opened after seek; playlist index tracking disabled while playback continues",
+                    exc_info=True,
+                )
+                self.playback_cursor = None
+                if not self.paused:
+                    self.index = None
+            return
+
+        try:
+            self.playback_cursor = LoadingCursor(
+                [path.name for path in self.active],
+                start_offset=start_offset,
+            )
+        except Exception:
+            # 位置が不明でも、確定した再生は止めない。
+            logging.warning(
+                "Bridge log could not be opened after playback; playlist index is unknown and playback continues",
+                exc_info=True,
+            )
+            self.playback_cursor = None
+            self.index = None
+
+    def _stop_after_transport_failure(self, connection, exc: Exception, message: str) -> None:
+        self.last_error = str(exc)
+        logging.exception(message)
+        self.active = []
+        self.active_sources = []
+        self.index = None
+        self.paused = False
+        self.active_operation_id = None
+        self.active_list_sha256 = None
+        self.playback_cursor = None
+        self._save_state("error")
+        try:
+            _send_response(connection, {"ok": False, "error": str(exc)})
+        except (OSError, EOFError):
+            pass
+        finally:
+            connection.close()
+        self.stopping = True
+
+    def _seek_to_index(self, target_index: int, connection) -> bool:
+        if not self.active:
+            raise RuntimeError("No playlist is currently active")
+        if target_index < 0 or target_index >= len(self.active):
+            raise ValueError(f"Index {target_index} is out of range (0..{len(self.active) - 1})")
+        if len(self.active) == 1:
+            self.index = 0
+            _send_response(connection, {"ok": True, "state": self._snapshot_state()})
+            connection.close()
+            return True
+        if self.index is not None and target_index == self.index:
+            _send_response(connection, {"ok": True, "state": self._snapshot_state()})
+            connection.close()
+            return True
+        try:
+            assert self.renderer is not None
+            self.renderer.seek_to_index(target_index, pause_after=self.paused)
+        except Exception as exc:
+            self._stop_after_transport_failure(connection, exc, "Manual playback seek failed")
+            return False
+        self.index = target_index
+        self.last_change = time.monotonic()
+        self._attach_loading_cursor(target_index, from_seek=True)
+        self._save_state()
+        _send_response(connection, {"ok": True, "state": self._snapshot_state()})
+        connection.close()
+        return True
+
+    def _step_relative(self, delta: int, connection) -> bool:
+        if not self.active:
+            raise RuntimeError("No playlist is currently active")
+        try:
+            assert self.renderer is not None
+            if delta > 0:
+                self.renderer.step_next(pause_after=self.paused)
+            else:
+                self.renderer.step_previous(pause_after=self.paused)
+        except Exception as exc:
+            self._stop_after_transport_failure(connection, exc, "Manual relative playback step failed")
+            return False
+        self.index = None
+        self.playback_cursor = None
+        self.last_change = time.monotonic()
+        self._save_state()
+        _send_response(connection, {"ok": True, "state": self._snapshot_state()})
+        connection.close()
+        return True
 
     def _initialize_display(self) -> None:
         self.renderer = RestBridge()
@@ -130,9 +287,9 @@ class DisplayWorker:
         command = payload.get("command")
         try:
             if command == "status":
-                state = _read_state()
-                state["busy"] = self.busy
-                _send_response(request.connection, {"ok": True, "state": state})
+                if self.active and not self.stopping:
+                    self._follow_playlist_index()
+                _send_response(request.connection, {"ok": True, "state": self._snapshot_state()})
                 request.connection.close()
                 return
             if command == "stop":
@@ -155,21 +312,119 @@ class DisplayWorker:
                 _send_response(request.connection, {"ok": True})
                 request.connection.close()
                 return
+            if self.stopping:
+                raise RuntimeError("Display worker is stopping")
+            if command == "next":
+                if not self.active:
+                    raise RuntimeError("No playlist is currently active")
+                self._follow_playlist_index()
+                if len(self.active) == 1:
+                    self._seek_to_index(0, request.connection)
+                elif self.index is not None:
+                    self._seek_to_index((self.index + 1) % len(self.active), request.connection)
+                else:
+                    self._step_relative(1, request.connection)
+                return
+            if command == "prev":
+                if not self.active:
+                    raise RuntimeError("No playlist is currently active")
+                self._follow_playlist_index()
+                if len(self.active) == 1:
+                    self._seek_to_index(0, request.connection)
+                elif self.index is not None:
+                    self._seek_to_index((self.index - 1) % len(self.active), request.connection)
+                else:
+                    self._step_relative(-1, request.connection)
+                return
+            if command == "jump":
+                if not self.active:
+                    raise RuntimeError("No playlist is currently active")
+                raw_index = payload.get("index")
+                if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                    raise ValueError("index must be an integer")
+                self._follow_playlist_index()
+                self._seek_to_index(raw_index, request.connection)
+                return
+            if command == "pause":
+                if not self.active:
+                    raise RuntimeError("No playlist is currently active")
+                self._follow_playlist_index()
+                if not self.paused:
+                    if len(self.active) > 1:
+                        try:
+                            assert self.renderer is not None
+                            self.renderer.pause_playback()
+                        except Exception as exc:
+                            self._stop_after_transport_failure(
+                                request.connection, exc, "Bridge pause failed"
+                            )
+                            return
+                    self.paused = True
+                    self._save_state()
+                _send_response(request.connection, {"ok": True, "state": self._snapshot_state()})
+                request.connection.close()
+                return
+            if command == "resume":
+                if not self.active:
+                    raise RuntimeError("No playlist is currently active")
+                self._follow_playlist_index()
+                if self.paused:
+                    if len(self.active) > 1:
+                        try:
+                            assert self.renderer is not None
+                            self.renderer.resume_playback()
+                        except Exception as exc:
+                            self._stop_after_transport_failure(
+                                request.connection, exc, "Bridge resume failed"
+                            )
+                            return
+                        if self.playback_cursor is None and self.index is not None:
+                            try:
+                                self.playback_cursor = LoadingCursor(
+                                    [path.name for path in self.active],
+                                    start_offset=None,
+                                    expected_index=(self.index + 1) % len(self.active),
+                                )
+                            except Exception:
+                                logging.warning(
+                                    "Bridge log could not be opened after resume; playlist index is unknown and playback continues",
+                                    exc_info=True,
+                                )
+                                self.index = None
+                    self.paused = False
+                    self.last_change = time.monotonic()
+                    self._save_state()
+                _send_response(request.connection, {"ok": True, "state": self._snapshot_state()})
+                request.connection.close()
+                return
             if command != "show":
                 raise ValueError(f"Unknown command: {command}")
             if self.busy:
                 raise RuntimeError("A playlist update is already in progress")
-            entries = read_playlist_entries(Path(payload["list_path"]))
+            resolved_list_path = Path(payload["list_path"]).expanduser().resolve()
+            try:
+                raw_bytes = resolved_list_path.read_bytes()
+            except OSError as exc:
+                raise PlaylistError(f"Cannot read playlist '{resolved_list_path}': {exc}") from exc
+            actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            expected_sha256 = payload.get("expected_sha256")
+            if expected_sha256 is not None:
+                if not isinstance(expected_sha256, str) or actual_sha256 != expected_sha256.strip().lower():
+                    raise ValueError("Playlist file changed before it could be loaded; please apply again")
+            entries = read_playlist_entries_from_bytes(raw_bytes, resolved_list_path)
             interval = float(payload.get("interval", 10))
             if not math.isfinite(interval) or interval <= 0:
                 raise ValueError("Interval must be greater than zero")
+            operation_id = str(payload.get("operation_id") or uuid.uuid4().hex)
             self.pending_intervals[self.generation + 1] = interval
             self.busy = True
             self.cancel_prepare = threading.Event()
             self.generation += 1
             generation = self.generation
             self.pending_sources[generation] = [entry.path for entry in entries]
-            self.pending_operations[generation] = str(payload.get("operation_id", ""))
+            self.pending_operations[generation] = operation_id
+            self.pending_list_paths[generation] = str(resolved_list_path)
+            self.pending_list_digests[generation] = actual_sha256
             self.last_error = None
             self._save_state("updating")
             self.pending.put((generation, request.connection))
@@ -236,36 +491,28 @@ class DisplayWorker:
                 if generation in self.cancelled_generations:
                     self.busy = False
                     self.cancelled_generations.discard(generation)
-                    self.pending_sources.pop(generation, None)
-                    self.pending_intervals.pop(generation, None)
-                    self.pending_operations.pop(generation, None)
-                    self._save_state("playing" if self.active else "error")
+                    self._cleanup_pending(generation)
+                    self._save_state(None if self.active else "error")
                     self._reply_pending(generation, {"ok": False, "error": "Playlist update was cancelled"})
                 continue
             self.busy = False
             if self.stopping or generation in self.cancelled_generations:
                 self.cancelled_generations.discard(generation)
-                self.pending_sources.pop(generation, None)
-                self.pending_intervals.pop(generation, None)
-                self.pending_operations.pop(generation, None)
-                self._save_state("playing" if self.active else "stopped")
+                self._cleanup_pending(generation)
+                self._save_state(None if (self.active and not self.stopping) else "stopped")
                 self._reply_pending(generation, {"ok": False, "error": "Playlist update was cancelled"})
                 continue
             if not self._pending_client_connected(generation):
-                self.pending_sources.pop(generation, None)
-                self.pending_intervals.pop(generation, None)
-                self.pending_operations.pop(generation, None)
-                self._save_state("playing" if self.active else "stopped")
+                self._cleanup_pending(generation)
+                self._save_state(None if self.active else "stopped")
                 logging.info("Show client disconnected before the playlist could be committed")
                 continue
             if error:
                 self.last_error = str(error)
                 logging.error("Playlist conversion failed: %s", error, exc_info=(type(error), error, error.__traceback__))
-                self._save_state("playing" if self.active else "error")
+                self._cleanup_pending(generation)
+                self._save_state(None if self.active else "error")
                 self._reply_pending(generation, {"ok": False, "error": str(error)})
-                self.pending_sources.pop(generation, None)
-                self.pending_intervals.pop(generation, None)
-                self.pending_operations.pop(generation, None)
                 if not self.active:
                     self.stopping = True
                 continue
@@ -285,27 +532,16 @@ class DisplayWorker:
             self.active = staged
             self.active_sources = self.pending_sources.pop(generation, [])
             self.interval = self.pending_intervals.pop(generation, 10.0)
-            self.pending_operations.pop(generation, None)
+            self.active_operation_id = self.pending_operations.pop(generation, None)
+            self.list_path = self.pending_list_paths.pop(generation, None)
+            self.active_list_sha256 = self.pending_list_digests.pop(generation, None)
+            self.paused = False
             self.index = 0
             self.last_change = time.monotonic()
             self.last_error = None
-            self.playback_cursor = None
-            if len(self.active) > 1:
-                try:
-                    start_offset = getattr(self.renderer, "playback_log_offset", None)
-                    self.playback_cursor = LoadingCursor(
-                        [path.name for path in self.active],
-                        start_offset=start_offset,
-                    )
-                except Exception:
-                    # 位置が不明でも、確定した再生は止めない。
-                    logging.warning(
-                        "Bridge log could not be opened after playback; playlist index is unknown and playback continues",
-                        exc_info=True,
-                    )
-                    self.index = None
+            self._attach_loading_cursor()
             self._save_state("playing")
-            self._reply_pending(generation, {"ok": True, "state": _read_state()})
+            self._reply_pending(generation, {"ok": True, "state": self._snapshot_state("playing")})
 
         if self.stopping:
             return
@@ -314,11 +550,9 @@ class DisplayWorker:
     def _reject_show_before_play(self, generation: int, exc: Exception) -> None:
         self.last_error = str(exc)
         logging.error("Playlist was rejected before playback: %s", exc)
-        self._save_state("playing" if self.active else "error")
+        self._cleanup_pending(generation)
+        self._save_state(None if self.active else "error")
         self._reply_pending(generation, {"ok": False, "error": str(exc)})
-        self.pending_sources.pop(generation, None)
-        self.pending_intervals.pop(generation, None)
-        self.pending_operations.pop(generation, None)
         if not self.active:
             self.stopping = True
 
@@ -329,12 +563,13 @@ class DisplayWorker:
         self.active = []
         self.active_sources = []
         self.index = None
+        self.paused = False
+        self.active_operation_id = None
+        self.active_list_sha256 = None
         self.playback_cursor = None
+        self._cleanup_pending(generation)
         self._save_state("error")
         self._reply_pending(generation, {"ok": False, "error": str(exc)})
-        self.pending_sources.pop(generation, None)
-        self.pending_intervals.pop(generation, None)
-        self.pending_operations.pop(generation, None)
         self.stopping = True
 
     def _follow_playlist_index(self) -> None:
@@ -350,12 +585,12 @@ class DisplayWorker:
             )
             self.index = None
             self.playback_cursor = None
-            self._save_state("playing")
+            self._save_state()
             return
         if index is None or index == self.index:
             return
         self.index = index
-        self._save_state("playing")
+        self._save_state()
 
     def _reply_pending(self, generation: int, response: dict) -> None:
         retained = []

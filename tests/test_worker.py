@@ -56,10 +56,30 @@ def make_worker(monkeypatch, tmp_path: Path) -> worker_module.DisplayWorker:
     class FakeRenderer:
         def __init__(self):
             self.presented = []
+            self.seeks = []
+            self.steps = []
+            self.pauses = 0
+            self.resumes = 0
+            self.playback_log_offset = None
             self.closed = False
 
         def show_playlist(self, paths, interval_ms):
             self.presented.append((list(paths), interval_ms))
+
+        def pause_playback(self):
+            self.pauses += 1
+
+        def resume_playback(self):
+            self.resumes += 1
+
+        def seek_to_index(self, index, *, pause_after=False):
+            self.seeks.append((index, pause_after))
+
+        def step_next(self, *, pause_after=False):
+            self.steps.append(("next", pause_after))
+
+        def step_previous(self, *, pause_after=False):
+            self.steps.append(("prev", pause_after))
 
         def health_check(self):
             pass
@@ -75,10 +95,16 @@ def make_worker(monkeypatch, tmp_path: Path) -> worker_module.DisplayWorker:
     worker.pending_sources = {}
     worker.pending_intervals = {}
     worker.pending_operations = {}
+    worker.pending_list_paths = {}
+    worker.pending_list_digests = {}
     worker.cancelled_generations = set()
     worker.index = 0
     worker.playback_cursor = None
     worker.interval = 10.0
+    worker.paused = False
+    worker.list_path = None
+    worker.active_operation_id = None
+    worker.active_list_sha256 = None
     worker.last_change = time.monotonic()
     worker.generation = 0
     worker.busy = False
@@ -130,7 +156,16 @@ def seed_active(worker: worker_module.DisplayWorker, sources: list[Path], interv
     worker.active = [Path(f"cache-{index}.png") for index in range(len(sources))]
     worker.interval = interval
     worker.index = 0
+    worker.paused = False
+    worker.active_operation_id = "seed-op"
+    worker.active_list_sha256 = "seed-sha"
     worker._save_state("playing")
+
+
+def send_req(worker: worker_module.DisplayWorker, payload: dict) -> FakeConnection:
+    connection = FakeConnection()
+    worker._handle_request(worker_module.Request(payload, connection))
+    return connection
 
 
 def test_show_ack_follows_first_draw_and_replaces_entire_playlist(monkeypatch, tmp_path):
@@ -451,3 +486,286 @@ def test_run_releases_singleton_lock_and_display_resources_on_stop(monkeypatch, 
     assert ("close_listener",) in calls
     assert ("renderer_close",) in calls
     assert calls[-1] == ("release",)
+
+
+def test_next_prev_seek_existing_playlist_and_update_loading_cursor(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    sources = [tmp_path / "a.png", tmp_path / "b.png", tmp_path / "c.png"]
+    seed_active(worker, sources, interval=10)
+    worker.active = [Path("a.png"), Path("b.png"), Path("c.png")]
+
+    r1 = send_req(worker, {"command": "next"})
+    assert r1.responses[0]["ok"] is True
+    assert r1.responses[0]["state"]["index"] == 1
+    assert r1.responses[0]["state"]["active_operation_id"] == "seed-op"
+
+    r2 = send_req(worker, {"command": "next"})
+    assert r2.responses[0]["state"]["index"] == 2
+    r3 = send_req(worker, {"command": "next"})
+    assert r3.responses[0]["state"]["index"] == 0
+    r4 = send_req(worker, {"command": "prev"})
+    assert r4.responses[0]["state"]["index"] == 2
+
+    assert worker.renderer.presented == []
+    assert worker.renderer.seeks == [(1, False), (2, False), (0, False), (2, False)]
+
+    # LoadingCursor expects index 0 (a.png) after seeking to index 2
+    log_path = tmp_path / "bridge.log"
+    with log_path.open("ab") as handle:
+        handle.write(b"Loading C:\\cache\\a.png with duration of: 10000 ms\n")
+    worker._pump()
+    assert worker.index == 0
+
+
+def test_pause_resume_and_navigation_while_paused(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    sources = [tmp_path / "a.png", tmp_path / "b.png", tmp_path / "c.png"]
+    seed_active(worker, sources, interval=1)
+    worker.active = [Path("a.png"), Path("b.png"), Path("c.png")]
+
+    pause_resp = send_req(worker, {"command": "pause"}).responses[0]
+    assert pause_resp["ok"] is True
+    assert pause_resp["state"]["paused"] is True
+    assert pause_resp["state"]["status"] == "paused"
+    assert worker.renderer.pauses == 1
+
+    # Duplicate pause is a no-op on Bridge
+    pause_dup = send_req(worker, {"command": "pause"}).responses[0]
+    assert pause_dup["ok"] is True
+    assert worker.renderer.pauses == 1
+
+    # next/prev/jump pass pause_after=True and keep paused=True
+    next_resp = send_req(worker, {"command": "next"}).responses[0]
+    assert next_resp["state"]["index"] == 1
+    assert next_resp["state"]["paused"] is True
+    assert next_resp["state"]["status"] == "paused"
+
+    jump_resp = send_req(worker, {"command": "jump", "index": 2}).responses[0]
+    assert jump_resp["state"]["index"] == 2
+    assert jump_resp["state"]["paused"] is True
+
+    prev_resp = send_req(worker, {"command": "prev"}).responses[0]
+    assert prev_resp["state"]["index"] == 1
+    assert prev_resp["state"]["paused"] is True
+    assert worker.renderer.seeks == [(1, True), (2, True), (1, True)]
+
+    resume_resp = send_req(worker, {"command": "resume"}).responses[0]
+    assert resume_resp["ok"] is True
+    assert resume_resp["state"]["paused"] is False
+    assert resume_resp["state"]["status"] == "playing"
+    assert worker.renderer.resumes == 1
+    assert worker.active_operation_id == "seed-op"
+    assert worker.renderer.presented == []
+
+    # After resume from index 1, log advancing to c.png tracks to index 2
+    log_path = tmp_path / "bridge.log"
+    with log_path.open("ab") as handle:
+        handle.write(b"Loading C:\\cache\\c.png with duration of: 1000 ms\n")
+    worker._pump()
+    assert worker.index == 2
+
+
+def test_jump_same_index_and_single_image_skip_bridge_calls_and_invalid_jump_rejected(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    seed_active(worker, [tmp_path / "only.png"], interval=5)
+
+    for cmd in (
+        {"command": "next"},
+        {"command": "prev"},
+        {"command": "jump", "index": 0},
+        {"command": "pause"},
+        {"command": "resume"},
+    ):
+        resp = send_req(worker, cmd).responses[0]
+        assert resp["ok"] is True
+        assert resp["state"]["index"] == 0
+    assert worker.renderer.presented == []
+    assert worker.renderer.seeks == []
+    assert worker.renderer.steps == []
+    assert worker.renderer.pauses == 0
+    assert worker.renderer.resumes == 0
+
+    for bad in (
+        {"command": "jump", "index": -1},
+        {"command": "jump", "index": 1},
+        {"command": "jump", "index": True},
+        {"command": "jump", "index": "0"},
+        {"command": "jump"},
+    ):
+        resp = send_req(worker, bad).responses[0]
+        assert resp["ok"] is False
+        assert worker.stopping is False
+
+
+def test_playback_controls_work_while_busy_and_failed_show_preserves_paused_and_operation_id(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    old = [tmp_path / "old-a.png", tmp_path / "old-b.png"]
+    seed_active(worker, old, interval=11)
+    send_req(worker, {"command": "pause"})
+
+    replacement = tmp_path / "replacement.png"
+    write_image(replacement, (1, 2, 3))
+    playlist = tmp_path / "list.txt"
+    write_playlist(playlist, [replacement])
+    monkeypatch.setattr(worker_module, "convert_to_rgbd", lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    show_conn = submit_show(worker, playlist, interval=4)
+    assert worker.busy is True
+
+    nav = send_req(worker, {"command": "next"}).responses[0]
+    assert nav["ok"] is True
+    assert nav["state"]["index"] == 1
+    assert nav["state"]["paused"] is True
+    assert nav["state"]["busy"] is True
+    assert nav["state"]["active_operation_id"] == "seed-op"
+
+    worker._pump()
+    assert show_conn.responses[0]["ok"] is False
+    assert worker.active_sources == old
+    assert worker.paused is True
+    assert worker.active_operation_id == "seed-op"
+    assert worker.active_list_sha256 == "seed-sha"
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "paused"
+    assert state["paused"] is True
+    assert state["active_operation_id"] == "seed-op"
+
+
+def test_rejected_show_while_paused_preserves_paused_and_unconfirmed_clears_metadata(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    old = [tmp_path / "old-a.png", tmp_path / "old-b.png"]
+    seed_active(worker, old, interval=11)
+    send_req(worker, {"command": "pause"})
+
+    replacement = tmp_path / "replacement.png"
+    write_image(replacement, (1, 2, 3))
+    cache_images(worker, [replacement])
+    playlist = tmp_path / "list.txt"
+    write_playlist(playlist, [replacement])
+    worker.renderer.show_playlist = lambda *_args, **_kwargs: (_ for _ in ()).throw(PlaylistRejected("insert failed"))
+
+    rej_conn = submit_show(worker, playlist, interval=4)
+    worker._pump()
+    assert rej_conn.responses[0]["ok"] is False
+    assert worker.paused is True
+    assert worker.active_operation_id == "seed-op"
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "paused"
+    assert state["paused"] is True
+
+    worker.renderer.show_playlist = lambda *_args, **_kwargs: (_ for _ in ()).throw(PlaylistUnconfirmed("play failed"))
+    unconf_conn = submit_show(worker, playlist, interval=4)
+    with pytest.raises(PlaylistUnconfirmed):
+        worker._pump()
+    assert unconf_conn.responses[0]["ok"] is False
+    assert worker.paused is False
+    assert worker.active_operation_id is None
+    assert worker.active_list_sha256 is None
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "error"
+    assert state["paused"] is False
+    assert state["active_operation_id"] is None
+
+
+def test_tracking_lost_preserves_status_supports_relative_step_and_recovers_on_jump(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    sources = [tmp_path / "a.png", tmp_path / "b.png", tmp_path / "c.png"]
+    seed_active(worker, sources, interval=5)
+    worker.active = [Path("a.png"), Path("b.png"), Path("c.png")]
+    send_req(worker, {"command": "pause"})
+
+    class FailingCursor:
+        def poll(self):
+            raise PlaylistTrackingLost("log lost")
+
+    worker.playback_cursor = FailingCursor()
+    worker._pump()
+    assert worker.index is None
+    assert worker.playback_cursor is None
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "paused"
+    assert state["index"] is None
+
+    # next / prev while index is None use step_next / step_previous and keep index=None
+    r_next = send_req(worker, {"command": "next"}).responses[0]
+    assert r_next["ok"] is True
+    assert r_next["state"]["index"] is None
+    r_prev = send_req(worker, {"command": "prev"}).responses[0]
+    assert r_prev["ok"] is True
+    assert r_prev["state"]["index"] is None
+    assert worker.renderer.steps == [("next", True), ("prev", True)]
+
+    # jump(2) recovers index=2 and re-attaches cursor
+    r_jump = send_req(worker, {"command": "jump", "index": 2}).responses[0]
+    assert r_jump["ok"] is True
+    assert r_jump["state"]["index"] == 2
+    assert worker.playback_cursor is not None
+
+
+def test_expected_sha256_verification_and_successful_show_resets_pause_and_operation_id(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    seed_active(worker, [tmp_path / "old.png"], interval=9)
+    send_req(worker, {"command": "pause"})
+
+    img = tmp_path / "new.png"
+    write_image(img, (10, 20, 30))
+    cache_images(worker, [img])
+    playlist = tmp_path / "list.txt"
+    write_playlist(playlist, [img])
+    digest = hashlib.sha256(playlist.read_bytes()).hexdigest()
+
+    mismatch = send_req(worker, {
+        "command": "show",
+        "list_path": str(playlist),
+        "interval": 6,
+        "operation_id": "op-bad",
+        "expected_sha256": "0" * 64,
+    }).responses[0]
+    assert mismatch["ok"] is False
+    assert "changed" in mismatch["error"]
+    assert worker.busy is False
+    assert worker.paused is True
+    assert worker.active_operation_id == "seed-op"
+
+    ok_conn = send_req(worker, {
+        "command": "show",
+        "list_path": str(playlist),
+        "interval": 6,
+        "operation_id": "op-good",
+        "expected_sha256": digest,
+    })
+    worker._pump()
+    resp = ok_conn.responses[0]
+    assert resp["ok"] is True
+    assert resp["state"]["paused"] is False
+    assert resp["state"]["status"] == "playing"
+    assert resp["state"]["index"] == 0
+    assert resp["state"]["list_path"] == str(playlist.resolve())
+    assert resp["state"]["active_operation_id"] == "op-good"
+    assert resp["state"]["active_list_sha256"] == digest
+
+
+def test_manual_controls_without_active_playlist_and_bridge_failure_on_transport(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    for cmd in ("next", "prev", "pause", "resume"):
+        resp = send_req(worker, {"command": cmd}).responses[0]
+        assert resp["ok"] is False
+        assert worker.stopping is False
+    resp = send_req(worker, {"command": "jump", "index": 0}).responses[0]
+    assert resp["ok"] is False
+    assert worker.stopping is False
+
+    seed_active(worker, [tmp_path / "a.png", tmp_path / "b.png"])
+    worker.renderer.seek_to_index = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("bridge disconnected"))
+    fail_resp = send_req(worker, {"command": "next"}).responses[0]
+    assert fail_resp["ok"] is False
+    assert "bridge disconnected" in fail_resp["error"]
+    assert worker.stopping is True
+    assert worker.active == []
+    assert worker.active_sources == []
+    assert worker.active_operation_id is None
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "error"
+    assert state["images"] == []
+    assert "bridge disconnected" in state["last_error"]
+

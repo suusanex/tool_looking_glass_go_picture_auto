@@ -20,6 +20,27 @@ uv run lookgo.py show --list "C:\Images\playlist.txt" --interval 15
 
 同時に別の `show` が処理中の場合はエラーになります。`status` と `stop` は画像の変換中にも実行できます。リストの検証や画像変換に失敗したときは Bridge へ再生を要求せず、既存の表示を保って `show` だけが失敗します。プレイリストの作成や登録に失敗した場合も同じです。`play_playlist` を送ったあとに失敗した場合は、画面が旧リストのままか新しいリストへ変わったかを確定できないため、旧リストの再生は報告せず worker を止めます。再表示するときは `show` を再実行してください。デバイス切断や Bridge の状態確認失敗でもログを残して worker を終了します。自動再接続や、失敗したリストの自動復帰は行いません。
 
+## GUI（再生操作・プレイリスト編集）
+
+Windows 10/11 環境では、鑑賞中の再生操作とプレイリスト編集を 1 画面で行える WinUI 3 (`Microsoft.UI.Reactor`) GUI を利用できます。
+
+### 前提環境と起動方法
+
+- [.NET 10 SDK](https://dotnet.microsoft.com/) 以降
+- Windows App Runtime 2.x（`Microsoft.WindowsAppSDK` 2.2.0 以上が動作する環境）
+- `uv`、Looking Glass Bridge、Desktop Mode の Looking Glass Go
+
+```powershell
+dotnet run --project gui/LookGo.Gui/LookGo.Gui.csproj -p:Platform=x64
+```
+
+### 画面構成と主な動作
+
+- **上段（鑑賞コントロール・表示中リスト）:** Python ワーカーが管理する現在の表示状態を正本として表示します。「前へ」「一時停止／再開」「次へ」「表示停止」「最新状態を取得」の各操作（単一 Bridge プレイリストに対する REST transport 制御）と、表示位置・状態バッジ・横方向フィルムストリップ型サムネイルを提供します。サムネイルをクリックすると該当画像へジャンプし、一時停止中の状態はそのまま維持されます（複数枚表示中の自動切替位置は Bridge ログから追従し、追跡不能時は「位置不明」と表示して再生を継続します。サムネイルをクリックして任意位置へジャンプすると追跡を再同期できます）。
+- **下段（プレイリスト編集・下書き）:** 上段の再生状態とは独立した編集領域です。「開く...」「新規」「保存」「名前を付けて保存...」「再生中を読込」のほか、画像追加・空行追加・上下並べ替え・削除・間隔設定（秒）ができます。左側の DataGrid のパス列をクリックして直接編集でき、右側の編集用サムネイルグリッドと選択状態が同期します。同一画像パスの重複行もそれぞれ個別に選択・並べ替え・削除でき、DataGrid の列ソートは無効化して再生順との混同を防いでいます。
+- **編集・保存と「表示へ反映」の分離:** 下段での編集や「保存」だけでは、現在 Looking Glass Go に表示中のスライドショーや上段のサムネイルは変わりません。「表示へ反映」を押すと、事前検証のうえで対象ファイルへ UTF-8（1 行 1 画像パス）で原子保存し、内容ハッシュ（SHA-256）を検証しながら Python バックエンドの完全置換処理を実行します。変換中も上段の鑑賞操作や「反映をキャンセル」を実行できます。検証・変換または `play_playlist` 前のプレイリスト登録に失敗した場合は失敗理由と未反映状態を明示して旧表示を保ち、`play_playlist` 送信後に失敗した場合は旧表示の継続を仮定せずワーカーを停止してエラー状態を上段に反映します。
+- **GUI を閉じた後の動作:** GUI ウィンドウを閉じてもバックグラウンドの表示ワーカーは停止せず表示を継続します。表示を終了したい場合は GUI の「表示停止」ボタンまたは `uv run lookgo.py stop` を実行してください。
+
 ## Looking Glass と Bridge の準備
 
 1. Looking Glass Go を付属 USB-C ケーブルで PC に接続します。PC の USB-C ポートは DisplayPort Alt Mode に対応している必要があります。非対応 PC では、Go 用 HDMI-to-USB-C adapter を使用して PC の映像出力に接続します。
@@ -88,14 +109,17 @@ C:\Users\me\Pictures\sample image.png
 - 本ツール: MIT License（[LICENSE](LICENSE)）
 - Depth Anything V2 Small Hugging Face モデル: Apache License 2.0。
 - Python の依存パッケージは `lookgo.py` の PEP 723 metadata に記載しています。各パッケージのライセンスは配布元の情報を参照してください。
+- GUI の依存パッケージ (`Microsoft.UI.Reactor` / `Microsoft.UI.Reactor.Advanced` 0.1.0-preview.18、MIT License、および `Microsoft.WindowsAppSDK` 2.2.0) は [gui/LookGo.Gui/LookGo.Gui.csproj](gui/LookGo.Gui/LookGo.Gui.csproj) に記載しています。
 - Looking Glass Bridge は別途公式サイトからインストールしてください。このツールには Bridge 本体や native SDK runtime を同梱しません。
 
 ## テスト
 
-開発環境でテストを実行する場合:
+開発環境で Python テスト・C# 結合テスト・GUI ビルドを確認する場合:
 
 ```powershell
 uv run lookgo.py _test -q
+dotnet test gui/LookGo.Core.Tests/LookGo.Core.Tests.csproj
+dotnet build gui/LookGo.Gui/LookGo.Gui.csproj -p:Platform=x64
 ```
 
 ## 表示確認状況
@@ -106,10 +130,14 @@ Bridge REST API と既知の RGBD テストパターンによる物理表示、`
 
 2026-11-23 に、修正後の CLI で単色画像3枚を2秒間隔で表示し、続けて1枚のリストへ置き換えました。3枚のあいだ `status` の index は 1、2、0、1、2、0 と進み、Bridge ログの Loading も同じ順の繰り返しでした。Private Bytes は3枚の読込後に約 1,604 MB から約 1,407 MB まで下がり、その短い周回では切替ごとの増加は見えませんでした。1枚へ置き換えたあとは、その画像だけが `playing` で index は 0 のまま、Bridge は `transport_control_pause` を受け、観測した数秒では次の Loading はありませんでした。`stop` 後に worker は終了しました。人の目による奥行き、数時間のメモリ、デバイス切断、`show` の端末を閉じたあとの継続は未確認です。
 
-以下の lookgo CLI による動作は、実機で未確認です。
+以下の lookgo CLI および GUI による実機動作は、実機で未確認です。
 
 - 写真とイラストで奥行き方向が意図どおりか確認する。
 - 同じリストを再指定して表示が置き換わることを確認する。
 - `show` の端末を閉じた後も表示が継続することを確認する。
 - 表示中にデバイスを切断した場合のログと終了状態を確認する。
 - `stop` 後の Go 本体の表示状態を確認する。
+- GUI 上段の「前へ」「次へ」およびフィルムストリップからのジャンプで、`transport_control_seek_to_index` により Go 実機の表示が切り替わり、自動切替位置の追跡も追従することを確認する。
+- GUI で複数枚を「一時停止」「再開」および一時停止中の前後移動・ジャンプを行ったとき、`transport_control_pause` / `transport_control_play` で一時停止の維持と解除が正しく動作することを Go 実機で確認する。
+- GUI で素早い前後移動や連続ジャンプを行っても描画と表示位置がずれないことを確認する。
+- GUI 下段でリスト編集後に「表示へ反映」を実行し、Go 実機の表示が単一プレイリストで完全置換されること、および失敗時に未反映状態と実表示状態が一致することを確認する。

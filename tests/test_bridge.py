@@ -15,6 +15,7 @@ from lookgo.bridge import (
     PlaylistUnconfirmed,
     RestBridge,
     _current_bridge_log,
+    _offset_after_endpoint_marker,
     _wait_until_showing,
 )
 
@@ -388,3 +389,109 @@ def test_http_uses_utf8_json_put_body(monkeypatch):
 
     assert observed == {"method": "PUT", "body": {"name": "Look Glass 日本語"}, "timeout": 10.0}
     assert result["status"]["value"] == "Completion"
+
+
+def test_transport_controls_send_official_endpoints_and_require_active_playlist(tmp_path: Path, monkeypatch):
+    unready = _ready_renderer()
+    with pytest.raises(RuntimeError, match="No active Bridge playlist"):
+        unready.pause_playback()
+    with pytest.raises(RuntimeError, match="No active Bridge playlist"):
+        unready.seek_to_index(0)
+    with pytest.raises(RuntimeError, match="No active Bridge playlist"):
+        unready.step_next()
+
+    renderer = _ready_renderer()
+    renderer.active_playlist = "lookgo-active"
+    monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"Showing a.png for 2000 ms\n")
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+    calls = []
+
+    def fake_put(endpoint: str, body: dict):
+        calls.append((endpoint, body))
+        if endpoint == "transport_control_seek_to_index":
+            with log_path.open("ab") as handle:
+                handle.write(
+                    b"Loading C:\\cache\\b.png with duration of: 2000 ms\n"
+                    b"2026-11-23 [Info] HTTPLibServer endpoint: /transport_control_seek_to_index\n"
+                    b"Loading C:\\cache\\c.png with duration of: 2000 ms\n"
+                )
+        return response(endpoint, wrap("payload", {}))
+
+    monkeypatch.setattr(renderer, "_put", fake_put)
+
+    renderer.pause_playback()
+    renderer.resume_playback()
+    renderer.seek_to_index(2)
+    assert renderer.playback_log_offset is not None
+    cursor = LoadingCursor(["a.png", "b.png", "c.png"], start_offset=renderer.playback_log_offset, expected_index=2, awaiting_seek=True)
+    # Skipped pre-marker b.png auto-advance and matched post-marker c.png cleanly
+    assert cursor.poll() == 2
+
+    renderer.seek_to_index(1, pause_after=True)
+    renderer.step_next(pause_after=True)
+    assert renderer.playback_log_offset is None
+    renderer.step_previous()
+
+    assert calls == [
+        ("transport_control_pause", {"orchestration": "{orch}"}),
+        ("transport_control_play", {"orchestration": "{orch}"}),
+        ("transport_control_seek_to_index", {"orchestration": "{orch}", "index": 2}),
+        ("transport_control_seek_to_index", {"orchestration": "{orch}", "index": 1}),
+        ("transport_control_pause", {"orchestration": "{orch}"}),
+        ("transport_control_next", {"orchestration": "{orch}"}),
+        ("transport_control_pause", {"orchestration": "{orch}"}),
+        ("transport_control_previous", {"orchestration": "{orch}"}),
+    ]
+
+
+def test_seek_to_index_succeeds_even_when_bridge_log_is_missing(monkeypatch):
+    renderer = _ready_renderer()
+    renderer.active_playlist = "lookgo-active"
+    monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: (_ for _ in ()).throw(RuntimeError("no log")))
+    calls = []
+    monkeypatch.setattr(renderer, "_put", lambda endpoint, body: calls.append((endpoint, body)) or response(endpoint, wrap("payload", {})))
+
+    renderer.seek_to_index(1)
+
+    assert calls == [("transport_control_seek_to_index", {"orchestration": "{orch}", "index": 1})]
+    assert renderer.playback_log_offset is None
+    assert _offset_after_endpoint_marker(None, 0, b"/transport_control_seek_to_index") is None
+
+
+def test_loading_cursor_awaiting_seek_skips_up_to_two_in_flight_known_frames_only(tmp_path: Path, monkeypatch):
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"")
+    start = log_path.stat().st_size
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"Loading C:\\cache\\b.png with duration of: 2000 ms\n"
+            b"Loading C:\\cache\\a.png with duration of: 2000 ms\n"
+            b"Loading C:\\cache\\c.png with duration of: 2000 ms\n"
+        )
+    cursor = LoadingCursor(["a.png", "b.png", "c.png"], start_offset=start, expected_index=2, awaiting_seek=True)
+    assert cursor.poll() == 2
+
+    # Unknown external image still triggers immediate tracking loss even during awaiting_seek
+    start2 = log_path.stat().st_size
+    with log_path.open("ab") as handle:
+        handle.write(b"Loading C:\\cache\\external.png with duration of: 2000 ms\n")
+    cursor2 = LoadingCursor(["a.png", "b.png", "c.png"], start_offset=start2, expected_index=2, awaiting_seek=True)
+    with pytest.raises(PlaylistTrackingLost, match="not playlist index"):
+        cursor2.poll()
+
+    # More than 2 non-target known frames also triggers tracking loss
+    start3 = log_path.stat().st_size
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"Loading C:\\cache\\a.png with duration of: 2000 ms\n"
+            b"Loading C:\\cache\\b.png with duration of: 2000 ms\n"
+            b"Loading C:\\cache\\a.png with duration of: 2000 ms\n"
+        )
+    cursor3 = LoadingCursor(["a.png", "b.png", "c.png"], start_offset=start3, expected_index=2, awaiting_seek=True)
+    with pytest.raises(PlaylistTrackingLost, match="not playlist index"):
+        cursor3.poll()

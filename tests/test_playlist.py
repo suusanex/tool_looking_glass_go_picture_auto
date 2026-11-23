@@ -3,7 +3,7 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
-from lookgo.playlist import PlaylistError, read_playlist, read_playlist_entries
+from lookgo.playlist import PlaylistError, read_playlist, read_playlist_entries, read_playlist_entries_from_bytes
 
 
 def test_reads_bom_relative_japanese_spaces_duplicates_and_order(tmp_path: Path) -> None:
@@ -41,6 +41,15 @@ def test_rejects_empty_list_and_unsupported_extensions(tmp_path: Path) -> None:
     listing.write_text("image.bmp", encoding="utf-8")
     with pytest.raises(PlaylistError, match="line 1"):
         read_playlist(listing)
+
+
+def test_reads_from_bytes_matches_file_reading(tmp_path: Path) -> None:
+    (tmp_path / "img.png").write_bytes(_png((1, 2, 3)))
+    listing = tmp_path / "playlist.txt"
+    raw = "\ufeffimg.png\nimg.png\n".encode("utf-8")
+    entries = read_playlist_entries_from_bytes(raw, listing)
+    assert [entry.path for entry in entries] == [tmp_path / "img.png", tmp_path / "img.png"]
+    assert [entry.line for entry in entries] == [1, 2]
 
 
 def _png(color: tuple[int, int, int]) -> bytes:

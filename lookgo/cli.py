@@ -10,6 +10,7 @@ import uuid
 
 from filelock import FileLock, Timeout
 
+from .gui_bridge import gui_bridge_entry
 from .settings import log_path
 from .worker import ensure_worker, get_saved_state, rest_smoke_entry, send_command, start_worker, worker_entry
 
@@ -46,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "_worker":
         return worker_entry()
+    if arguments and arguments[0] == "_bridge":
+        return gui_bridge_entry()
     if arguments and arguments[0] == "_smoke":
         return rest_smoke_entry(float(arguments[1]) if len(arguments) > 1 else 60.0)
     if arguments and arguments[0] == "_test":
