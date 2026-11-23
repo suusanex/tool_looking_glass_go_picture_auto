@@ -172,6 +172,12 @@ sealed class WorkspaceRoot : Component<WorkspaceProps>
         {
             if (fileOpBusy)
                 return;
+            var initialCheck = PlaylistDocument.ValidateForSave(latestEditorRef.Current.Rows);
+            if (initialCheck is not null)
+            {
+                updateEditor(cur => PlaylistEditorReducer.CompleteApplyFailure(cur, null, initialCheck));
+                return;
+            }
             setFileOpBusy(true);
             try
             {
@@ -190,6 +196,12 @@ sealed class WorkspaceRoot : Component<WorkspaceProps>
                     return;
 
                 var current = latestEditorRef.Current;
+                var saveError = PlaylistDocument.ValidateForSave(current.Rows);
+                if (saveError is not null)
+                {
+                    updateEditor(cur => PlaylistEditorReducer.CompleteApplyFailure(cur, null, saveError));
+                    return;
+                }
                 if (!current.CanOverwriteFile(target.Path))
                 {
                     updateEditor(cur => PlaylistEditorReducer.CompleteApplyFailure(
@@ -214,6 +226,12 @@ sealed class WorkspaceRoot : Component<WorkspaceProps>
         async Task SavePlaylistAsync()
         {
             var current = latestEditorRef.Current;
+            var saveError = PlaylistDocument.ValidateForSave(current.Rows);
+            if (saveError is not null)
+            {
+                updateEditor(cur => PlaylistEditorReducer.CompleteApplyFailure(cur, null, saveError));
+                return;
+            }
             if (string.IsNullOrWhiteSpace(current.FilePath))
             {
                 await SaveAsPlaylistAsync();

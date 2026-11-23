@@ -152,7 +152,7 @@ public sealed class EditorSection : Component<EditorSectionProps>
                     Button("新規", props.OnNew),
                     Button("保存", props.OnSave).IsEnabled(!props.FileOpBusy && canSaveCurrent),
                     Button("名前を付けて保存...", props.OnSaveAs).IsEnabled(!props.FileOpBusy),
-                    Button("再生中を読込", props.OnLoadFromPlayback).IsEnabled(playback.Images.Count > 0),
+                    Button("再生中を読込", props.OnLoadFromPlayback).IsEnabled(playback.WorkerRunning && playback.Images.Count > 0),
                     Border(Empty()).Flex(grow: 1),
                     TextBlock("間隔(秒):").FontSize(13).VAlign(VerticalAlignment.Center),
                     NumberBox(

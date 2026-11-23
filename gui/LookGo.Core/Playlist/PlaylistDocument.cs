@@ -167,14 +167,26 @@ public static class PlaylistDocument
         return (fullPath, rows, sha256);
     }
 
+    public static string? ValidateForSave(IReadOnlyList<EditorRow> rows)
+    {
+        foreach (var row in rows)
+        {
+            if (string.IsNullOrWhiteSpace(row.RawPath))
+                return $"{row.OrderNumber} 行目のパスが未入力です。パスを入力するか行を削除してから保存してください。";
+        }
+        return null;
+    }
+
     public static byte[] SerializeUtf8Bytes(IReadOnlyList<EditorRow> rows)
     {
+        var saveError = ValidateForSave(rows);
+        if (saveError is not null)
+            throw new InvalidOperationException(saveError);
+
         var sb = new StringBuilder();
         foreach (var row in rows)
         {
-            var trimmed = row.RawPath?.Trim() ?? "";
-            if (trimmed.Length == 0)
-                continue;
+            var trimmed = row.RawPath.Trim();
             sb.Append(trimmed);
             sb.Append('\n');
         }

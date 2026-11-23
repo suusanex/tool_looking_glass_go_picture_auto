@@ -29,8 +29,8 @@ public sealed class PlaybackSection : Component<PlaybackSectionProps>
     {
         var props = Props;
         var playback = props.Playback;
-        var hasImages = playback.Images.Count > 0;
-        var canControl = playback.WorkerRunning && hasImages && !props.ActionBusy;
+        var hasImages = playback.WorkerRunning && playback.Images.Count > 0;
+        var canControl = hasImages && !props.ActionBusy;
 
         var statusText = GetPlaybackStatusLabel(playback);
         var positionText = hasImages && playback.Index is { } idx
@@ -51,7 +51,10 @@ public sealed class PlaybackSection : Component<PlaybackSectionProps>
             : playback.LastError;
 
         var stripItems = UseMemo(
-            () => playback.Images.Select((path, index) => new PlaybackStripItem(index, path)).ToArray(),
+            () => playback.WorkerRunning
+                ? playback.Images.Select((path, index) => new PlaybackStripItem(index, path)).ToArray()
+                : Array.Empty<PlaybackStripItem>(),
+            playback.WorkerRunning,
             playback.Images);
 
         Element stripArea = stripItems.Length > 0

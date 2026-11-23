@@ -14,6 +14,7 @@ public sealed class PythonBridgeClient : IBackendClient
     private readonly string _executable;
     private readonly IReadOnlyList<string> _baseArguments;
     private readonly IReadOnlyDictionary<string, string>? _extraEnvironment;
+    private readonly TimeSpan _readyTimeout;
     private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonElement>> _pending = new();
@@ -28,12 +29,14 @@ public sealed class PythonBridgeClient : IBackendClient
         string workingDirectory,
         string executable = "uv",
         IReadOnlyList<string>? baseArguments = null,
-        IReadOnlyDictionary<string, string>? extraEnvironment = null)
+        IReadOnlyDictionary<string, string>? extraEnvironment = null,
+        TimeSpan? readyTimeout = null)
     {
         _workingDirectory = workingDirectory;
         _executable = executable;
         _baseArguments = baseArguments ?? ["run", "lookgo.py", "_bridge"];
         _extraEnvironment = extraEnvironment;
+        _readyTimeout = readyTimeout ?? DefaultReadyTimeout;
     }
 
     public Task<BackendResult> GetStatusAsync(CancellationToken ct = default)
@@ -183,31 +186,70 @@ public sealed class PythonBridgeClient : IBackendClient
             }
 
             var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            if (!process.Start())
-                throw new InvalidOperationException("Failed to start Python bridge process.");
-
-            _stderrTail.Clear();
-            _stderrTask = Task.Run(() => DrainStderrAsync(process.StandardError));
-
-            using var readyCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            readyCts.CancelAfter(DefaultReadyTimeout);
-
-            var readyLine = await process.StandardOutput.ReadLineAsync(readyCts.Token).ConfigureAwait(false);
-            if (readyLine is null)
+            try
             {
-                var detail = GetStderrSummary();
-                throw new IOException($"Python bridge exited before ready event. {detail}".Trim());
+                if (!process.Start())
+                    throw new InvalidOperationException("Failed to start Python bridge process.");
+            }
+            catch
+            {
+                process.Dispose();
+                throw;
             }
 
-            using (var doc = JsonDocument.Parse(readyLine))
+            try
             {
-                if (!doc.RootElement.TryGetProperty("event", out var ev) || ev.GetString() != "ready")
-                    throw new InvalidDataException($"Unexpected bridge handshake: {readyLine}");
-            }
+                _stderrTail.Clear();
+                _stderrTask = Task.Run(() => DrainStderrAsync(process.StandardError));
 
-            _process = process;
-            _readerTask = Task.Run(() => ReadLoopAsync(process));
-            return process;
+                using var readyCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readyCts.CancelAfter(_readyTimeout);
+
+                string? readyLine;
+                try
+                {
+                    readyLine = await process.StandardOutput.ReadLineAsync(readyCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+                {
+                    var detail = GetStderrSummary();
+                    throw new TimeoutException($"Timed out waiting for Python bridge ready event. {detail}".Trim(), ex);
+                }
+
+                if (readyLine is null)
+                {
+                    var detail = GetStderrSummary();
+                    throw new IOException($"Python bridge exited before ready event. {detail}".Trim());
+                }
+
+                using (var doc = JsonDocument.Parse(readyLine))
+                {
+                    if (!doc.RootElement.TryGetProperty("event", out var ev) || ev.GetString() != "ready")
+                        throw new InvalidDataException($"Unexpected bridge handshake: {readyLine}");
+                }
+
+                _process = process;
+                _readerTask = Task.Run(() => ReadLoopAsync(process));
+                return process;
+            }
+            catch
+            {
+                try
+                {
+                    if (!process.HasExited)
+                        process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                }
+                if (_stderrTask is { } stderrTask)
+                {
+                    try { await stderrTask.WaitAsync(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false); } catch { }
+                    _stderrTask = null;
+                }
+                process.Dispose();
+                throw;
+            }
         }
         finally
         {

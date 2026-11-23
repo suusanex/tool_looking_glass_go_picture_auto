@@ -20,6 +20,8 @@ def _stopped_state() -> dict:
     prior_status = state.get("status", "unknown")
     state["last_status"] = prior_status
     state["status"] = "stopped"
+    state["images"] = []
+    state["index"] = None
     state["worker_running"] = False
     state["busy"] = False
     state["paused"] = False

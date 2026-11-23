@@ -105,6 +105,24 @@ public sealed class PlaylistDocumentTests : IDisposable
     }
 
     [Fact]
+    public void ValidateForSave_And_WriteFileAtomic_RejectEmptyPathRowsInsteadOfOmitting()
+    {
+        var listPath = Path.Combine(_tempDir, "with_empty.txt");
+        var img = CreateImage("ok.png", MakePngHeader());
+        var rows = new[]
+        {
+            PlaylistDocument.CreateRow(1, img, _tempDir),
+            PlaylistDocument.CreateRow(2, "   ", _tempDir),
+        };
+
+        var err = PlaylistDocument.ValidateForSave(rows);
+        Assert.NotNull(err);
+        Assert.Contains("2 行目", err);
+        Assert.Throws<InvalidOperationException>(() => PlaylistDocument.WriteFileAtomic(listPath, rows));
+        Assert.False(File.Exists(listPath));
+    }
+
+    [Fact]
     public void WriteFileAtomic_IsReadableByPythonPlaylistReader()
     {
         var repoRoot = FindRepoRoot();
