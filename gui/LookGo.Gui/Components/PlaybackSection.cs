@@ -33,18 +33,22 @@ public sealed class PlaybackSection : Component<PlaybackSectionProps>
         var canControl = hasImages && !props.ActionBusy;
 
         var statusText = GetPlaybackStatusLabel(playback);
-        var positionText = hasImages && playback.Index is { } idx
-            ? $"{idx + 1} / {playback.Images.Count} 枚 • {playback.Interval:0.#} 秒ごと"
+        var positionText = hasImages
+            ? playback.Index is { } idx
+                ? $"{idx + 1} / {playback.Images.Count} 枚 • {playback.Interval:0.#} 秒ごと"
+                : $"位置不明 / {playback.Images.Count} 枚 • {playback.Interval:0.#} 秒ごと（サムネイル選択で再同期可）"
             : playback.WorkerRunning ? "待機中（未表示）" : "停止中";
 
-        var statusBrush = playback.Status switch
-        {
-            "error" => Theme.SystemCriticalBackground,
-            "paused" => Theme.SystemCautionBackground,
-            "updating" => Theme.SystemAttentionBackground,
-            "playing" => Theme.SystemSuccessBackground,
-            _ => Theme.SubtleFill,
-        };
+        var statusBrush = playback.IsErrorEnded
+            ? Theme.SystemCriticalBackground
+            : playback.Status switch
+            {
+                "error" => Theme.SystemCriticalBackground,
+                "paused" => Theme.SystemCautionBackground,
+                "updating" => Theme.SystemAttentionBackground,
+                "playing" => Theme.SystemSuccessBackground,
+                _ => Theme.SubtleFill,
+            };
 
         var errorMessage = !string.IsNullOrWhiteSpace(props.UiError)
             ? props.UiError
@@ -120,7 +124,7 @@ public sealed class PlaybackSection : Component<PlaybackSectionProps>
     private static string GetPlaybackStatusLabel(PlaybackState playback)
     {
         if (!playback.WorkerRunning)
-            return playback.Status == "error" ? "エラー終了" : "停止中";
+            return playback.IsErrorEnded ? "エラー終了" : "停止中";
         if (playback.Busy)
             return playback.Paused ? "表示更新中（一時停止継続）" : "表示更新中（再生継続）";
         return playback.Status switch

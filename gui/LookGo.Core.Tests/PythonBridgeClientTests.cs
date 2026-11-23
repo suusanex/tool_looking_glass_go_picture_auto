@@ -56,7 +56,7 @@ import threading
 
 from PIL import Image
 
-from lookgo import gui_bridge, worker as worker_module
+from lookgo import bridge as bridge_module, gui_bridge, worker as worker_module
 
 
 def make_png(path: str, color: tuple[int, int, int]) -> None:
@@ -66,6 +66,7 @@ def make_png(path: str, color: tuple[int, int, int]) -> None:
 class FakeBridge:
     def __init__(self, record_path: Path):
         self.record_path = record_path
+        self.playback_log_offset = None
 
     def connect(self):
         return type("Dev", (), {"aspect": 1.0, "index": 0, "hwid": "FAKE-GO", "rows": 6, "columns": 11, "view_count": 66})()
@@ -73,9 +74,30 @@ class FakeBridge:
     def health_check(self):
         pass
 
-    def present(self, path: Path, duration_ms: int):
+    def _record(self, line: str) -> None:
         with self.record_path.open("a", encoding="utf-8") as f:
-            f.write(f"{path.name}|{duration_ms}\n")
+            f.write(line + "\n")
+
+    def show_playlist(self, paths, interval_ms: int):
+        self._record(f"show_playlist|{','.join(p.name for p in paths)}|{interval_ms}")
+        self.playback_log_offset = None
+        return "fake-playlist"
+
+    def pause_playback(self):
+        self._record("pause")
+
+    def resume_playback(self):
+        self._record("resume")
+
+    def seek_to_index(self, index: int, *, pause_after: bool = False):
+        self._record(f"seek|{index}|{pause_after}")
+        self.playback_log_offset = None
+
+    def step_next(self, *, pause_after: bool = False):
+        self._record(f"step_next|{pause_after}")
+
+    def step_previous(self, *, pause_after: bool = False):
+        self._record(f"step_prev|{pause_after}")
 
     def close(self):
         pass
@@ -88,6 +110,10 @@ if sys.argv[1] == "prep-images":
     raise SystemExit(0)
 
 # Run in-process fake worker thread backed by real DisplayWorker + real gui_bridge
+bridge_log = Path(os.environ["LOOKGO_TEST_LOG"]).with_name("bridge.log")
+bridge_log.write_bytes(b"")
+bridge_module._current_bridge_log = lambda: bridge_log
+
 worker = worker_module.DisplayWorker()
 worker.estimator = object()
 worker_module.RestBridge = lambda: FakeBridge(Path(os.environ["LOOKGO_TEST_LOG"]))
@@ -239,12 +265,55 @@ raise SystemExit(gui_bridge.gui_bridge_entry())
         Assert.Equal("op-de", showDe.State.ActiveOperationId);
         Assert.Equal("表示へ反映済み", editor.GetStatusLabel(showDe.State));
 
-        // 8) Stop cleanly
+        // 8) Stop cleanly and confirm single-playlist lifecycle + transport controls
         var stopRes = await client.StopAsync();
         Assert.True(stopRes.Ok);
         Assert.False(stopRes.State!.WorkerRunning);
         Assert.Equal("stopped", stopRes.State.Status);
         Assert.False(editor.IsDisplayedMatch(stopRes.State));
+
+        var bridgeLogLines = File.ReadAllLines(logFile, Encoding.UTF8);
+        Assert.Equal(2, bridgeLogLines.Count(l => l.StartsWith("show_playlist|", StringComparison.Ordinal)));
+        Assert.Contains("seek|1|False", bridgeLogLines);
+        Assert.Contains("pause", bridgeLogLines);
+        Assert.Contains("seek|2|True", bridgeLogLines);
+        Assert.Contains("seek|1|True", bridgeLogLines);
+        Assert.Contains("resume", bridgeLogLines);
+    }
+
+    [Fact]
+    public void PlaybackState_FromJson_ParsesLastStatusErrorAndNullIndexWithImages()
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse("""
+        {
+          "status": "stopped",
+          "last_status": "error",
+          "images": ["C:\\img\\a.png", "C:\\img\\b.png"],
+          "index": null,
+          "worker_running": false,
+          "last_error": "play_playlist failed"
+        }
+        """);
+        var stoppedError = PlaybackState.FromJson(doc.RootElement);
+        Assert.Equal("stopped", stoppedError.Status);
+        Assert.Equal("error", stoppedError.LastStatus);
+        Assert.Null(stoppedError.Index);
+        Assert.Equal(2, stoppedError.Images.Count);
+        Assert.True(stoppedError.IsErrorEnded);
+
+        using var trackingLostDoc = System.Text.Json.JsonDocument.Parse("""
+        {
+          "status": "playing",
+          "images": ["C:\\img\\a.png", "C:\\img\\b.png"],
+          "index": null,
+          "worker_running": true
+        }
+        """);
+        var trackingLost = PlaybackState.FromJson(trackingLostDoc.RootElement);
+        Assert.True(trackingLost.WorkerRunning);
+        Assert.Null(trackingLost.Index);
+        Assert.Equal(2, trackingLost.Images.Count);
+        Assert.False(trackingLost.IsErrorEnded);
     }
 
     [Fact]
