@@ -19,7 +19,7 @@ from multiprocessing.connection import Client, Listener
 from filelock import FileLock, Timeout
 from PIL import Image
 
-from .bridge import RestBridge
+from .bridge import LoadingCursor, PlaylistRejected, RestBridge
 from .imaging import DepthEstimator, cache_key, convert_to_rgbd
 from .playlist import read_playlist_entries
 from .settings import (
@@ -85,9 +85,10 @@ class DisplayWorker:
         self.pending_intervals: dict[int, float] = {}
         self.pending_operations: dict[int, str] = {}
         self.cancelled_generations: set[int] = set()
-        self.index = 0
+        self.index: int | None = 0
         self.interval = 10.0
         self.last_change = time.monotonic()
+        self.playback_cursor: LoadingCursor | None = None
         self.generation = 0
         self.busy = False
         self.stopping = False
@@ -274,12 +275,12 @@ class DisplayWorker:
             try:
                 assert self.renderer is not None
                 interval = self.pending_intervals[generation]
-                self.renderer.present(staged[0], duration_ms=round(interval * 1000))
+                self.renderer.show_playlist(staged, round(interval * 1000))
+            except PlaylistRejected as exc:
+                self._reject_show_before_play(generation, exc)
+                continue
             except Exception as exc:
-                self.last_error = str(exc)
-                logging.exception("First frame failed")
-                self._save_state("error")
-                self._reply_pending(generation, {"ok": False, "error": str(exc)})
+                self._stop_after_unconfirmed_play(generation, exc)
                 raise
             self.active = staged
             self.active_sources = self.pending_sources.pop(generation, [])
@@ -288,23 +289,69 @@ class DisplayWorker:
             self.index = 0
             self.last_change = time.monotonic()
             self.last_error = None
+            self.playback_cursor = None
+            if len(self.active) > 1:
+                try:
+                    self.playback_cursor = LoadingCursor([path.name for path in self.active])
+                except Exception:
+                    # 位置が不明でも、確定した再生は止めない。
+                    logging.warning(
+                        "Bridge log could not be opened after playback; playlist index is unknown and playback continues",
+                        exc_info=True,
+                    )
+                    self.index = None
             self._save_state("playing")
             self._reply_pending(generation, {"ok": True, "state": _read_state()})
 
         if self.stopping:
             return
-        # 1枚のリストは Bridge 側の loop で固定する。ここでの再送は間隔ごとに表示を作り直す。
-        if len(self.active) > 1 and time.monotonic() - self.last_change >= self.interval:
-            next_index = (self.index + 1) % len(self.active)
-            try:
-                assert self.renderer is not None
-                self.renderer.present(self.active[next_index], duration_ms=round(self.interval * 1000))
-            except Exception:
-                logging.exception("Image playback failed")
-                raise
-            self.index = next_index
-            self.last_change = time.monotonic()
+        self._follow_playlist_index()
+
+    def _reject_show_before_play(self, generation: int, exc: Exception) -> None:
+        self.last_error = str(exc)
+        logging.error("Playlist was rejected before playback: %s", exc)
+        self._save_state("playing" if self.active else "error")
+        self._reply_pending(generation, {"ok": False, "error": str(exc)})
+        self.pending_sources.pop(generation, None)
+        self.pending_intervals.pop(generation, None)
+        self.pending_operations.pop(generation, None)
+        if not self.active:
+            self.stopping = True
+
+    def _stop_after_unconfirmed_play(self, generation: int, exc: Exception) -> None:
+        # 再生要求後は旧表示が残っていると報告しない。後始末は worker 終了時の close が行う。
+        self.last_error = str(exc)
+        logging.error("Playlist playback was not confirmed: %s", exc)
+        self.active = []
+        self.active_sources = []
+        self.index = None
+        self.playback_cursor = None
+        self._save_state("error")
+        self._reply_pending(generation, {"ok": False, "error": str(exc)})
+        self.pending_sources.pop(generation, None)
+        self.pending_intervals.pop(generation, None)
+        self.pending_operations.pop(generation, None)
+        self.stopping = True
+
+    def _follow_playlist_index(self) -> None:
+        cursor = self.playback_cursor
+        if cursor is None or not self.active or self.index is None:
+            return
+        try:
+            index = cursor.poll()
+        except Exception:
+            logging.warning(
+                "Bridge log can no longer be followed; playlist index is unknown and playback continues",
+                exc_info=True,
+            )
+            self.index = None
+            self.playback_cursor = None
             self._save_state("playing")
+            return
+        if index is None or index == self.index:
+            return
+        self.index = index
+        self._save_state("playing")
 
     def _reply_pending(self, generation: int, response: dict) -> None:
         retained = []
@@ -480,7 +527,7 @@ def rest_smoke_entry(seconds: float = 60.0) -> int:
         image.paste(rgb, (0, 0))
         image.paste(depth.convert("RGB"), (rgb_width, 0))
         image.save(path, format="PNG")
-        renderer.present(path, duration_ms=max(1, round(seconds * 1000)))
+        renderer.show_playlist([path], max(1, round(seconds * 1000)))
         print(
             f"REST display smoke active for {seconds:g}s on Go head {device.index} "
             f"(aspect {device.aspect:g}, depth location 2)",

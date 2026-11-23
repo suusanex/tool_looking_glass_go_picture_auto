@@ -7,7 +7,16 @@ import time
 
 import pytest
 
-from lookgo.bridge import DisplayDevice, RestBridge, _current_bridge_log, _wait_until_showing
+from lookgo.bridge import (
+    DisplayDevice,
+    LoadingCursor,
+    PlaylistRejected,
+    PlaylistTrackingLost,
+    PlaylistUnconfirmed,
+    RestBridge,
+    _current_bridge_log,
+    _wait_until_showing,
+)
 
 
 def wrap(name: str, value, kind: str = "WSTRING") -> dict:
@@ -83,10 +92,15 @@ def test_failure_statuses_are_rejected(status: str):
         RestBridge._completion(response("play_playlist", wrap("payload", {}), status), "play_playlist")
 
 
-def test_present_creates_and_plays_new_playlist_before_deleting_old(tmp_path: Path, monkeypatch):
+def _ready_renderer() -> RestBridge:
     renderer = RestBridge()
     renderer.orchestration = "{orch}"
     renderer.device = DisplayDevice(2, "LKG-E04851", 0.5625, 6, 11, 66)
+    return renderer
+
+
+def test_show_playlist_loops_every_image_then_deletes_the_previous_playlist(tmp_path: Path, monkeypatch):
+    renderer = _ready_renderer()
     renderer.active_playlist = "lookgo-old"
     renderer.owned_playlists.add("lookgo-old")
     monkeypatch.setattr(renderer, "_available_go", lambda: None)
@@ -94,42 +108,98 @@ def test_present_creates_and_plays_new_playlist_before_deleting_old(tmp_path: Pa
     log_path.write_bytes(b"Showing older.png for 1 ms\n")
     monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
     calls = []
-    image = tmp_path / "RGBD 日本語.png"
-    image.write_bytes(b"file")
+    first = tmp_path / "RGBD 日本語.png"
+    second = tmp_path / "second.png"
+    first.write_bytes(b"file")
+    second.write_bytes(b"file-2")
 
     def fake_put(endpoint: str, body: dict):
         calls.append((endpoint, body))
         if endpoint == "play_playlist":
             with log_path.open("ab") as handle:
-                handle.write(f"Loading {image.name}\nShowing {image.name} for 10000 ms\n".encode())
-        if endpoint == "available_output_devices":
-            return available_devices()
+                handle.write(f"Loading {first.name}\nShowing {first.name} for 10000 ms\n".encode())
         return response(endpoint, wrap("payload", {}))
 
     monkeypatch.setattr(renderer, "_put", fake_put)
-    name = renderer.present(image, duration_ms=15_000)
+    name = renderer.show_playlist([first, second], interval_ms=2_000)
 
     assert name.startswith("lookgo-")
     assert [endpoint for endpoint, _ in calls] == [
-        "instance_playlist", "insert_playlist_entry", "play_playlist", "show_window", "delete_playlist"
+        "instance_playlist",
+        "insert_playlist_entry",
+        "insert_playlist_entry",
+        "play_playlist",
+        "show_window",
+        "delete_playlist",
     ]
+    assert "transport_control_pause" not in [endpoint for endpoint, _ in calls]
     assert renderer.window_shown is True
-    insert = calls[1][1]
-    assert insert["uri"] == str(image.resolve())
-    assert insert["id"] == 0 and insert["index"] == 0
-    assert (insert["rows"], insert["cols"], insert["view_count"]) == (6, 11, 66)
-    assert insert["aspect"] == 0.5625 and insert["depth_loc"] == 2 and insert["isRGBD"] == 1
-    assert calls[2][1]["head_index"] == 2
-    assert calls[3][1] == {"orchestration": "{orch}", "show_window": True, "head_index": 2}
-    assert calls[4][1] == {"orchestration": "{orch}", "name": "lookgo-old", "loop": True}
+    assert calls[1][1]["uri"] == str(first.resolve())
+    assert calls[1][1]["durationMS"] == 2_000 and calls[1][1]["index"] == 0
+    assert calls[2][1]["uri"] == str(second.resolve())
+    assert calls[2][1]["durationMS"] == 2_000 and calls[2][1]["index"] == 1
+    assert calls[1][1]["depth_loc"] == 2 and calls[1][1]["isRGBD"] == 1
+    assert calls[3][1]["head_index"] == 2
+    assert calls[4][1] == {"orchestration": "{orch}", "show_window": True, "head_index": 2}
+    assert calls[5][1] == {"orchestration": "{orch}", "name": "lookgo-old", "loop": True}
     assert renderer.active_playlist == name
     assert renderer.owned_playlists == {name}
 
 
-def test_present_failure_does_not_delete_previous_playlist(tmp_path: Path, monkeypatch):
-    renderer = RestBridge()
-    renderer.orchestration = "{orch}"
-    renderer.device = DisplayDevice(2, "LKG-E04851", 0.5625, 6, 11, 66)
+def test_single_image_playlist_pauses_after_show(tmp_path: Path, monkeypatch):
+    renderer = _ready_renderer()
+    monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"")
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+    image = tmp_path / "only.png"
+    image.write_bytes(b"file")
+    calls = []
+
+    def fake_put(endpoint: str, body: dict):
+        calls.append((endpoint, body))
+        if endpoint == "play_playlist":
+            with log_path.open("ab") as handle:
+                handle.write(f"Showing {image.name} for 60000 ms\n".encode())
+        return response(endpoint, wrap("payload", {}))
+
+    monkeypatch.setattr(renderer, "_put", fake_put)
+    renderer.show_playlist([image], interval_ms=3_000)
+
+    assert [endpoint for endpoint, _ in calls] == [
+        "instance_playlist", "insert_playlist_entry", "play_playlist", "show_window", "transport_control_pause"
+    ]
+    assert calls[1][1]["durationMS"] == 60_000
+    assert calls[4][1] == {"orchestration": "{orch}"}
+    assert renderer.window_shown is True
+
+
+def test_insert_failure_deletes_only_the_new_playlist(tmp_path: Path, monkeypatch):
+    renderer = _ready_renderer()
+    renderer.active_playlist = "lookgo-old"
+    renderer.owned_playlists.add("lookgo-old")
+    renderer.window_shown = True
+    monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    calls = []
+
+    def fail_insert(endpoint: str, body: dict):
+        calls.append((endpoint, body))
+        if endpoint == "insert_playlist_entry":
+            raise RuntimeError("insert failed")
+        return response(endpoint, wrap("payload", {}))
+
+    monkeypatch.setattr(renderer, "_put", fail_insert)
+    with pytest.raises(PlaylistRejected, match="insert failed"):
+        renderer.show_playlist([tmp_path / "image.png"], interval_ms=10_000)
+    assert renderer.active_playlist == "lookgo-old"
+    assert renderer.owned_playlists == {"lookgo-old"}
+    assert renderer.window_shown is True
+    assert [endpoint for endpoint, _ in calls] == ["instance_playlist", "insert_playlist_entry", "delete_playlist"]
+    assert calls[2][1]["name"] != "lookgo-old"
+
+
+def test_play_failure_leaves_both_playlists_for_cleanup(tmp_path: Path, monkeypatch):
+    renderer = _ready_renderer()
     renderer.active_playlist = "lookgo-old"
     renderer.owned_playlists.add("lookgo-old")
     monkeypatch.setattr(renderer, "_available_go", lambda: None)
@@ -143,17 +213,16 @@ def test_present_failure_does_not_delete_previous_playlist(tmp_path: Path, monke
         return response(endpoint, wrap("payload", {}))
 
     monkeypatch.setattr(renderer, "_put", fail_play)
-    with pytest.raises(RuntimeError, match="play_playlist"):
-        renderer.present(tmp_path / "image.png", duration_ms=10_000)
+    with pytest.raises(PlaylistUnconfirmed, match="play_playlist"):
+        renderer.show_playlist([tmp_path / "image.png"], interval_ms=10_000)
     assert renderer.active_playlist == "lookgo-old"
     assert "lookgo-old" in renderer.owned_playlists
+    assert len(renderer.owned_playlists) == 2
     assert renderer.window_shown is False
 
 
-def test_present_does_not_show_window_before_bridge_shows_the_image(tmp_path: Path, monkeypatch):
-    renderer = RestBridge()
-    renderer.orchestration = "{orch}"
-    renderer.device = DisplayDevice(2, "LKG-E04851", 0.5625, 6, 11, 66)
+def test_show_window_is_not_sent_before_bridge_shows_the_image(tmp_path: Path, monkeypatch):
+    renderer = _ready_renderer()
     monkeypatch.setattr(renderer, "_available_go", lambda: None)
     monkeypatch.setattr("lookgo.bridge._PLAYBACK_START_TIMEOUT", 0.15)
     log_path = tmp_path / "bridge.log"
@@ -168,10 +237,54 @@ def test_present_does_not_show_window_before_bridge_shows_the_image(tmp_path: Pa
         return response(endpoint, wrap("payload", {}))
 
     monkeypatch.setattr(renderer, "_put", fake_put)
-    with pytest.raises(RuntimeError, match="show_window was not sent"):
-        renderer.present(image, duration_ms=10_000)
+    with pytest.raises(PlaylistUnconfirmed, match="show_window was not sent"):
+        renderer.show_playlist([image], interval_ms=10_000)
     assert order == ["instance_playlist", "insert_playlist_entry", "play_playlist"]
     assert renderer.window_shown is False
+
+
+def test_pause_failure_keeps_the_window_marked_shown(tmp_path: Path, monkeypatch):
+    renderer = _ready_renderer()
+    renderer.window_shown = True
+    monkeypatch.setattr(renderer, "_available_go", lambda: None)
+    log_path = tmp_path / "bridge.log"
+    image = tmp_path / "image.png"
+    image.write_bytes(b"file")
+    log_path.write_bytes(b"")
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+
+    def fail_pause(endpoint: str, _body: dict):
+        if endpoint == "play_playlist":
+            with log_path.open("ab") as handle:
+                handle.write(f"Showing {image.name} for 60000 ms\n".encode())
+        if endpoint == "transport_control_pause":
+            raise RuntimeError("pause failed")
+        return response(endpoint, wrap("payload", {}))
+
+    monkeypatch.setattr(renderer, "_put", fail_pause)
+    with pytest.raises(PlaylistUnconfirmed, match="pause failed"):
+        renderer.show_playlist([image], interval_ms=10_000)
+    assert renderer.window_shown is True
+    assert renderer.active_playlist is None
+
+
+def test_loading_cursor_follows_order_and_rejects_a_mismatch(tmp_path: Path, monkeypatch):
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"Showing a.png for 1 ms\n")
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+    cursor = LoadingCursor(["a.png", "b.png", "a.png"])
+    assert cursor.poll() is None
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"Playlist entry loaded a.png\n"
+            b"Loading C:\\cache\\b.png with duration of: 2000 ms\n"
+            b"Loading C:\\cache\\a.png with duration of: 2000 ms\n"
+        )
+    assert cursor.poll() == 2
+    with log_path.open("ab") as handle:
+        handle.write(b"Loading C:\\cache\\c.png with duration of: 2000 ms\n")
+    with pytest.raises(PlaylistTrackingLost, match="not playlist index"):
+        cursor.poll()
 
 
 def test_wait_until_showing_ignores_loading_and_older_lines(tmp_path: Path):

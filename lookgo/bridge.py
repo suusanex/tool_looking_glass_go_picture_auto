@@ -15,6 +15,20 @@ from .settings import DEPTHINESS, DEPTH_LOCATION, FOCUS
 
 # 対象画像は競合がなければ 1 秒未満で Showing になる。出なければ表示せず止める。
 _PLAYBACK_START_TIMEOUT = 30.0
+# 1枚表示で pause するまでの余裕。固定表示の期限ではない。
+_HOLD_DURATION_MS = 60_000
+
+
+class PlaylistRejected(RuntimeError):
+    """play_playlist を送る前の失敗。既存の再生は変えていない。"""
+
+
+class PlaylistUnconfirmed(RuntimeError):
+    """play_playlist を送ったあと、反映成功前に失敗した。表示は確定しない。"""
+
+
+class PlaylistTrackingLost(RuntimeError):
+    """反映成功後に Bridge ログから現在位置を対応付けできなくなった。再生は続けられる。"""
 
 
 @dataclass(frozen=True)
@@ -168,55 +182,99 @@ class RestBridge:
         self._http("GET")
         self._available_go()
 
-    def present(self, image_path: Path, duration_ms: int) -> str:
+    def show_playlist(self, image_paths: list[Path], interval_ms: int) -> str:
+        """確定した画像リストを1つのプレイリストで表示する。
+
+        複数枚は interval_ms ごとに Bridge がループする。1枚は表示後に pause する。
+        play_playlist 前の失敗は PlaylistRejected。送ったあとの失敗は PlaylistUnconfirmed で、
+        旧リストの再生し直しはしない。
+        """
         if self.orchestration is None or self.device is None:
-            raise RuntimeError("Bridge renderer is not connected")
-        self._available_go()
+            raise PlaylistRejected("Bridge renderer is not connected")
+        if not image_paths:
+            raise PlaylistRejected("Playlist has no images")
+        try:
+            self._available_go()
+        except Exception as exc:
+            raise PlaylistRejected(str(exc)) from exc
+
+        pause = len(image_paths) == 1
+        duration_ms = _HOLD_DURATION_MS if pause else max(1, int(interval_ms))
         name = f"lookgo-{uuid.uuid4().hex}"
         playlist = {"orchestration": self.orchestration, "name": name}
-        self._put("instance_playlist", {**playlist, "loop": True})
-        self.owned_playlists.add(name)
-        uri = str(image_path.resolve())
-        self._put("insert_playlist_entry", {
-            **playlist,
-            "id": 0,
-            "index": 0,
-            "uri": uri,
-            "focus": FOCUS,
-            "rows": self.device.rows,
-            "cols": self.device.columns,
-            "aspect": self.device.aspect,
-            "view_count": self.device.view_count,
-            "durationMS": max(1, int(duration_ms)),
-            "crop_pos_x": 0,
-            "crop_pos_y": 0,
-            "isRGBD": 1,
-            "depth_loc": DEPTH_LOCATION,
-            "depth_inversion": 0,
-            "chroma_depth": 0,
-            "depthiness": DEPTHINESS,
-            "zoom": 1,
-        })
+        try:
+            self._put("instance_playlist", {**playlist, "loop": True})
+            self.owned_playlists.add(name)
+            for index, image_path in enumerate(image_paths):
+                self._put("insert_playlist_entry", {
+                    **playlist,
+                    "id": index,
+                    "index": index,
+                    "uri": str(image_path.resolve()),
+                    "focus": FOCUS,
+                    "rows": self.device.rows,
+                    "cols": self.device.columns,
+                    "aspect": self.device.aspect,
+                    "view_count": self.device.view_count,
+                    "durationMS": duration_ms,
+                    "crop_pos_x": 0,
+                    "crop_pos_y": 0,
+                    "isRGBD": 1,
+                    "depth_loc": DEPTH_LOCATION,
+                    "depth_inversion": 0,
+                    "chroma_depth": 0,
+                    "depthiness": DEPTHINESS,
+                    "zoom": 1,
+                })
+        except Exception as exc:
+            self._discard_unplayed(name)
+            raise PlaylistRejected(str(exc)) from exc
+
+        try:
+            log_path = _current_bridge_log()
+            log_offset = log_path.stat().st_size
+        except Exception as exc:
+            self._discard_unplayed(name)
+            raise PlaylistRejected(f"Cannot read Looking Glass Bridge log before playback: {exc}") from exc
+
         # play_playlist の HTTP 応答も New Item Playing も、そのプロセスで最初の OpenGL 初期化より先に届く。
         # 初期化中の show_window は REST を止めて、再起動まで GET / もタイムアウトさせる。
         # Bridge ログに Showing が出てから表示する。出ないときは show_window を送らない。
-        log_path = _current_bridge_log()
-        log_offset = log_path.stat().st_size
-        self._put("play_playlist", {**playlist, "head_index": self.device.index})
-        _wait_until_showing(log_path, log_offset, image_path.name, _PLAYBACK_START_TIMEOUT)
-        self._put("show_window", {
-            "orchestration": self.orchestration,
-            "show_window": True,
-            "head_index": self.device.index,
-        })
-        self.window_shown = True
+        try:
+            self._put("play_playlist", {**playlist, "head_index": self.device.index})
+        except Exception as exc:
+            raise PlaylistUnconfirmed(str(exc)) from exc
+        try:
+            _wait_until_showing(log_path, log_offset, image_paths[0].name, _PLAYBACK_START_TIMEOUT)
+            self._put("show_window", {
+                "orchestration": self.orchestration,
+                "show_window": True,
+                "head_index": self.device.index,
+            })
+            self.window_shown = True
+            if pause:
+                self._put("transport_control_pause", {"orchestration": self.orchestration})
+        except Exception as exc:
+            raise PlaylistUnconfirmed(str(exc)) from exc
 
         previous = self.active_playlist
         self.active_playlist = name
         if previous and previous != name:
-            self._delete_playlist(previous)
-        logging.info("Displayed RGBD image through Bridge playlist %s", name)
+            try:
+                self._delete_playlist(previous)
+            except Exception:
+                # 新しい表示は確定済み。削除失敗で再生を止めず、close 時に所有リストとして再試行する。
+                logging.exception("Failed to delete the previous Bridge playlist %s", previous)
+        logging.info("Displayed %s RGBD images through Bridge playlist %s", len(image_paths), name)
         return name
+
+    def _discard_unplayed(self, name: str) -> None:
+        if name not in self.owned_playlists:
+            return
+        try:
+            self._delete_playlist(name)
+        except Exception:
+            logging.exception("Failed to delete unplayed Bridge playlist %s", name)
 
     def _delete_playlist(self, name: str) -> None:
         if not self.orchestration:
@@ -293,3 +351,58 @@ def _wait_until_showing(log_path: Path, start_offset: int, file_name: str, timeo
                 logging.info("Bridge is showing %s", file_name)
                 return
         time.sleep(0.05)
+
+
+class LoadingCursor:
+    """反映成功後の Loading 行から、複数枚プレイリストの現在位置を追う。"""
+
+    def __init__(self, file_names: list[str]) -> None:
+        if len(file_names) < 2:
+            raise ValueError("Loading cursor is only used for multiple images")
+        self.file_names = list(file_names)
+        self.expected = 1
+        self.log_path = _current_bridge_log()
+        self.offset = self.log_path.stat().st_size
+        self.pending = b""
+
+    def poll(self) -> int | None:
+        try:
+            size = self.log_path.stat().st_size
+            if size < self.offset:
+                raise PlaylistTrackingLost(f"Bridge log {self.log_path} shrank")
+            chunk = b""
+            if size > self.offset:
+                with self.log_path.open("rb") as handle:
+                    handle.seek(self.offset)
+                    chunk = handle.read(size - self.offset)
+                self.offset = size
+        except PlaylistTrackingLost:
+            raise
+        except OSError as exc:
+            raise PlaylistTrackingLost(f"Cannot read Looking Glass Bridge log {self.log_path}: {exc}") from exc
+        if not chunk:
+            return None
+        self.pending += chunk
+        latest: int | None = None
+        while b"\n" in self.pending:
+            raw, self.pending = self.pending.split(b"\n", 1)
+            loaded = _loading_file_name(raw)
+            if loaded is None:
+                continue
+            if loaded != self.file_names[self.expected]:
+                raise PlaylistTrackingLost(
+                    f"Bridge loaded {loaded}, which is not playlist index {self.expected}"
+                )
+            latest = self.expected
+            self.expected = (self.expected + 1) % len(self.file_names)
+        return latest
+
+
+def _loading_file_name(line: bytes) -> str | None:
+    text = line.decode("utf-8", errors="replace")
+    if "Loading " not in text or " with duration" not in text:
+        return None
+    shown = text.split("Loading ", 1)[1].split(" with duration", 1)[0].strip()
+    if not shown:
+        return None
+    return Path(shown).name
