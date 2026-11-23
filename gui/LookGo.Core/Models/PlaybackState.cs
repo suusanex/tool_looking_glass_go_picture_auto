@@ -7,6 +7,7 @@ public sealed record PlaybackState
     public static PlaybackState Empty { get; } = new();
 
     public string Status { get; init; } = "stopped";
+    public string? LastStatus { get; init; }
     public IReadOnlyList<string> Images { get; init; } = Array.Empty<string>();
     public int? Index { get; init; }
     public bool Busy { get; init; }
@@ -18,6 +19,11 @@ public sealed record PlaybackState
     public string? LastError { get; init; }
     public bool WorkerRunning { get; init; }
     public string? LogPath { get; init; }
+
+    public bool IsErrorEnded =>
+        !WorkerRunning &&
+        (string.Equals(Status, "error", StringComparison.Ordinal) ||
+         string.Equals(LastStatus, "error", StringComparison.Ordinal));
 
     public static PlaybackState FromJson(JsonElement element)
     {
@@ -45,6 +51,7 @@ public sealed record PlaybackState
         return new PlaybackState
         {
             Status = GetString(element, "status") ?? "stopped",
+            LastStatus = GetString(element, "last_status"),
             Images = images,
             Index = index,
             Busy = GetBool(element, "busy"),

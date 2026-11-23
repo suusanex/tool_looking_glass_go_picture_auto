@@ -91,6 +91,10 @@ public sealed class EditorSection : Component<EditorSectionProps>
                         ? Theme.SystemCautionBackground
                         : Theme.SubtleFill;
 
+        var applyErrorTitle = playback.IsErrorEnded
+            ? "表示反映エラー（表示を確定できずワーカーを停止しました）"
+            : "表示反映エラー（現在の Go 表示には反映されていません）";
+
         var dataGrid = Component<DataGridComponent<EditorRow>, DataGridElement<EditorRow>>(
             new DataGridElement<EditorRow>
             {
@@ -195,7 +199,7 @@ public sealed class EditorSection : Component<EditorSectionProps>
 
                 // Row 2: Validation / Apply failure InfoBar
                 (!string.IsNullOrWhiteSpace(editor.ApplyError)
-                    ? InfoBar("表示反映エラー（現在の Go 表示には反映されていません）", editor.ApplyError)
+                    ? InfoBar(applyErrorTitle, editor.ApplyError)
                         .Severity(InfoBarSeverity.Error)
                         .IsClosable(false)
                         .Margin(0, 0, 0, 8)
