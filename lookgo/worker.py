@@ -292,7 +292,11 @@ class DisplayWorker:
             self.playback_cursor = None
             if len(self.active) > 1:
                 try:
-                    self.playback_cursor = LoadingCursor([path.name for path in self.active])
+                    start_offset = getattr(self.renderer, "playback_log_offset", None)
+                    self.playback_cursor = LoadingCursor(
+                        [path.name for path in self.active],
+                        start_offset=start_offset,
+                    )
                 except Exception:
                     # 位置が不明でも、確定した再生は止めない。
                     logging.warning(

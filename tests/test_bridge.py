@@ -268,6 +268,21 @@ def test_pause_failure_keeps_the_window_marked_shown(tmp_path: Path, monkeypatch
     assert renderer.active_playlist is None
 
 
+def test_loading_cursor_reads_the_first_image_from_the_pre_play_offset(tmp_path: Path, monkeypatch):
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"older line\n")
+    start = log_path.stat().st_size
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+    with log_path.open("ab") as handle:
+        handle.write(
+            b"Loading C:\\cache\\a.png with duration of: 2000 ms\n"
+            b"Showing a.png for 2000 ms\n"
+            b"Loading C:\\cache\\b.png with duration of: 2000 ms\n"
+        )
+    cursor = LoadingCursor(["a.png", "b.png", "c.png"], start_offset=start)
+    assert cursor.poll() == 1
+
+
 def test_loading_cursor_follows_order_and_rejects_a_mismatch(tmp_path: Path, monkeypatch):
     log_path = tmp_path / "bridge.log"
     log_path.write_bytes(b"Showing a.png for 1 ms\n")
