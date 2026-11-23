@@ -7,8 +7,11 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from PIL import Image
 
+from lookgo.bridge import PlaylistRejected, PlaylistTrackingLost, PlaylistUnconfirmed
 from lookgo import worker as worker_module
 
 
@@ -55,8 +58,8 @@ def make_worker(monkeypatch, tmp_path: Path) -> worker_module.DisplayWorker:
             self.presented = []
             self.closed = False
 
-        def present(self, path, duration_ms):
-            self.presented.append((path, duration_ms))
+        def show_playlist(self, paths, interval_ms):
+            self.presented.append((list(paths), interval_ms))
 
         def health_check(self):
             pass
@@ -74,6 +77,7 @@ def make_worker(monkeypatch, tmp_path: Path) -> worker_module.DisplayWorker:
     worker.pending_operations = {}
     worker.cancelled_generations = set()
     worker.index = 0
+    worker.playback_cursor = None
     worker.interval = 10.0
     worker.last_change = time.monotonic()
     worker.generation = 0
@@ -84,7 +88,10 @@ def make_worker(monkeypatch, tmp_path: Path) -> worker_module.DisplayWorker:
     state_file = tmp_path / "worker-state.json"
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
+    bridge_log = tmp_path / "bridge.log"
+    bridge_log.write_bytes(b"")
     monkeypatch.setattr(worker_module, "state_path", lambda: state_file)
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: bridge_log)
     monkeypatch.setattr(worker_module, "cache_directory", lambda: cache_dir)
     monkeypatch.setattr(worker_module, "cache_key", lambda data, *_args: hashlib.sha256(data).hexdigest())
     monkeypatch.setattr(worker_module.threading, "Thread", InlineThread)
@@ -141,9 +148,9 @@ def test_show_ack_follows_first_draw_and_replaces_entire_playlist(monkeypatch, t
     assert worker.active_sources == []
 
     draw_observations = []
-    worker.renderer.present = lambda path, duration_ms: draw_observations.append((path, duration_ms, list(first_connection.responses)))
+    worker.renderer.show_playlist = lambda paths, interval_ms: draw_observations.append((list(paths), interval_ms, list(first_connection.responses)))
     worker._pump()
-    assert draw_observations == [(worker.active[0], 3000, [])]
+    assert draw_observations == [(worker.active, 3000, [])]
     assert first_connection.responses[0]["ok"] is True
     assert worker.active_sources == first
     assert worker.interval == 3
@@ -204,13 +211,15 @@ def test_first_draw_failure_returns_error_without_committing(monkeypatch, tmp_pa
     cache_images(worker, [image])
     playlist = tmp_path / "list.txt"
     write_playlist(playlist, [image])
-    worker.renderer.present = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("draw failed"))
+    worker.renderer.show_playlist = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        PlaylistUnconfirmed("playback was not confirmed")
+    )
 
     connection = submit_show(worker, playlist)
     try:
         worker._pump()
-    except RuntimeError as exc:
-        assert str(exc) == "draw failed"
+    except PlaylistUnconfirmed as exc:
+        assert str(exc) == "playback was not confirmed"
     else:
         raise AssertionError("A failed first draw must stop the worker pump")
 
@@ -321,13 +330,13 @@ def test_disconnected_show_client_is_not_requeued(monkeypatch, tmp_path):
     assert disconnected.closed is True
 
 
-def test_single_image_stays_fixed_and_multiple_images_wrap(monkeypatch, tmp_path):
+def test_single_image_is_not_redrawn_and_multiple_images_follow_the_log(monkeypatch, tmp_path):
     worker = make_worker(monkeypatch, tmp_path)
     first = tmp_path / "first.png"
     seed_active(worker, [first], interval=1)
-    drawn = []
     worker.active = [Path("first-cache.png")]
-    worker.renderer.present = lambda path, duration_ms: drawn.append(path)
+    drawn = []
+    worker.renderer.show_playlist = lambda paths, interval_ms: drawn.append(paths)
     worker.last_change = time.monotonic() - 2
 
     worker._pump()
@@ -335,16 +344,77 @@ def test_single_image_stays_fixed_and_multiple_images_wrap(monkeypatch, tmp_path
     assert worker.index == 0
     assert drawn == []
 
-    worker.active = [Path("first-cache.png"), Path("second-cache.png")]
+    log_path = tmp_path / "bridge.log"
+    log_path.write_bytes(b"")
+    monkeypatch.setattr("lookgo.bridge._current_bridge_log", lambda: log_path)
+    worker.active = [Path("a.png"), Path("b.png")]
+    worker.active_sources = [tmp_path / "a.png", tmp_path / "b.png"]
     worker.index = 0
-    worker.last_change = time.monotonic() - 2
+    worker.playback_cursor = worker_module.LoadingCursor(["a.png", "b.png"])
+    with log_path.open("ab") as handle:
+        handle.write(b"Loading C:\\cache\\b.png with duration of: 2000 ms\n")
     worker._pump()
     assert worker.index == 1
-    assert drawn == [Path("second-cache.png")]
-    worker.last_change = time.monotonic() - 2
+    assert drawn == []
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "playing"
+    assert state["index"] == 1
+
+    worker.playback_cursor.poll = lambda: (_ for _ in ()).throw(PlaylistTrackingLost("unreadable"))
     worker._pump()
-    assert worker.index == 0
-    assert drawn[-1] == Path("first-cache.png")
+    assert worker.index is None
+    assert worker.playback_cursor is None
+    assert worker.stopping is False
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "playing"
+    assert state["index"] is None
+    assert state["images"] == [str(tmp_path / "a.png"), str(tmp_path / "b.png")]
+
+
+def test_rejected_replacement_keeps_the_current_display(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    old = [tmp_path / "old.png"]
+    seed_active(worker, old, interval=4)
+    replacement = tmp_path / "replacement.png"
+    write_image(replacement, (1, 2, 3))
+    cache_images(worker, [replacement])
+    playlist = tmp_path / "list.txt"
+    write_playlist(playlist, [replacement])
+    worker.renderer.show_playlist = lambda *_args, **_kwargs: (_ for _ in ()).throw(PlaylistRejected("insert failed"))
+
+    connection = submit_show(worker, playlist, interval=9)
+    worker._pump()
+
+    assert connection.responses[0]["ok"] is False
+    assert worker.active_sources == old
+    assert worker.interval == 4
+    assert worker.stopping is False
+
+
+def test_unconfirmed_replacement_stops_without_reporting_the_old_list(monkeypatch, tmp_path):
+    worker = make_worker(monkeypatch, tmp_path)
+    old = [tmp_path / "old.png"]
+    seed_active(worker, old, interval=4)
+    replacement = tmp_path / "replacement.png"
+    write_image(replacement, (4, 5, 6))
+    cache_images(worker, [replacement])
+    playlist = tmp_path / "list.txt"
+    write_playlist(playlist, [replacement])
+    worker.renderer.show_playlist = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        PlaylistUnconfirmed("showing was not confirmed")
+    )
+
+    connection = submit_show(worker, playlist, interval=9)
+    with pytest.raises(PlaylistUnconfirmed):
+        worker._pump()
+
+    assert connection.responses[0]["ok"] is False
+    assert worker.active_sources == []
+    assert worker.stopping is True
+    state = json.loads(worker_module.state_path().read_text(encoding="utf-8"))
+    assert state["status"] == "error"
+    assert state["images"] == []
+    assert state["index"] is None
 
 
 def test_run_releases_singleton_lock_and_display_resources_on_stop(monkeypatch, tmp_path):
