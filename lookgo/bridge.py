@@ -51,6 +51,8 @@ class RestBridge:
         self.device: DisplayDevice | None = None
         self.active_playlist: str | None = None
         self.owned_playlists: set[str] = set()
+        # play_playlist を送る直前のログ位置。反映成功後の位置追跡が、その前の Loading を取りこぼさない。
+        self.playback_log_offset: int | None = None
         # show_window(true) が成功するまで False。未表示の間は close でも隠さない。
         self.window_shown = False
 
@@ -258,6 +260,7 @@ class RestBridge:
             raise PlaylistUnconfirmed(str(exc)) from exc
 
         previous = self.active_playlist
+        self.playback_log_offset = log_offset
         self.active_playlist = name
         if previous and previous != name:
             try:
@@ -356,13 +359,18 @@ def _wait_until_showing(log_path: Path, start_offset: int, file_name: str, timeo
 class LoadingCursor:
     """反映成功後の Loading 行から、複数枚プレイリストの現在位置を追う。"""
 
-    def __init__(self, file_names: list[str]) -> None:
+    def __init__(self, file_names: list[str], start_offset: int | None = None) -> None:
         if len(file_names) < 2:
             raise ValueError("Loading cursor is only used for multiple images")
         self.file_names = list(file_names)
-        self.expected = 1
         self.log_path = _current_bridge_log()
-        self.offset = self.log_path.stat().st_size
+        # 再生前の位置を渡されたときは先頭画像の Loading から読む。未指定時は現在位置の次、つまり2枚目から読む。
+        if start_offset is None:
+            self.offset = self.log_path.stat().st_size
+            self.expected = 1
+        else:
+            self.offset = start_offset
+            self.expected = 0
         self.pending = b""
 
     def poll(self) -> int | None:
