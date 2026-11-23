@@ -14,12 +14,10 @@ class PlaylistEntry:
     line: int
 
 
-def read_playlist_entries(list_path: Path) -> list[PlaylistEntry]:
+def read_playlist_entries_from_bytes(raw_bytes: bytes, list_path: Path) -> list[PlaylistEntry]:
     list_path = list_path.expanduser().resolve()
     try:
-        lines = list_path.read_text(encoding="utf-8-sig").splitlines()
-    except OSError as exc:
-        raise PlaylistError(f"Cannot read playlist '{list_path}': {exc}") from exc
+        lines = raw_bytes.decode("utf-8-sig").splitlines()
     except UnicodeError as exc:
         raise PlaylistError(f"Playlist is not valid UTF-8: '{list_path}'") from exc
 
@@ -55,6 +53,15 @@ def read_playlist_entries(list_path: Path) -> list[PlaylistEntry]:
     if not images:
         raise PlaylistError(f"Playlist is empty: '{list_path}'")
     return images
+
+
+def read_playlist_entries(list_path: Path) -> list[PlaylistEntry]:
+    list_path = list_path.expanduser().resolve()
+    try:
+        raw_bytes = list_path.read_bytes()
+    except OSError as exc:
+        raise PlaylistError(f"Cannot read playlist '{list_path}': {exc}") from exc
+    return read_playlist_entries_from_bytes(raw_bytes, list_path)
 
 
 def read_playlist(list_path: Path) -> list[Path]:

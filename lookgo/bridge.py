@@ -271,6 +271,52 @@ class RestBridge:
         logging.info("Displayed %s RGBD images through Bridge playlist %s", len(image_paths), name)
         return name
 
+    def _require_active_playlist(self) -> None:
+        if self.orchestration is None or self.device is None or self.active_playlist is None:
+            raise RuntimeError("No active Bridge playlist is available")
+        self._available_go()
+
+    def pause_playback(self) -> None:
+        self._require_active_playlist()
+        self._put("transport_control_pause", {"orchestration": self.orchestration})
+
+    def resume_playback(self) -> None:
+        self._require_active_playlist()
+        self._put("transport_control_play", {"orchestration": self.orchestration})
+
+    def seek_to_index(self, index: int, *, pause_after: bool = False) -> None:
+        self._require_active_playlist()
+        log_path: Path | None = None
+        pre_offset: int | None = None
+        try:
+            log_path = _current_bridge_log()
+            pre_offset = log_path.stat().st_size
+        except Exception:
+            logging.warning("Bridge log could not be inspected before seek; index tracking may reset", exc_info=True)
+        self._put("transport_control_seek_to_index", {
+            "orchestration": self.orchestration,
+            "index": int(index),
+        })
+        if pause_after:
+            self._put("transport_control_pause", {"orchestration": self.orchestration})
+        self.playback_log_offset = _offset_after_endpoint_marker(
+            log_path, pre_offset, b"/transport_control_seek_to_index"
+        )
+
+    def step_next(self, *, pause_after: bool = False) -> None:
+        self._require_active_playlist()
+        self._put("transport_control_next", {"orchestration": self.orchestration})
+        if pause_after:
+            self._put("transport_control_pause", {"orchestration": self.orchestration})
+        self.playback_log_offset = None
+
+    def step_previous(self, *, pause_after: bool = False) -> None:
+        self._require_active_playlist()
+        self._put("transport_control_previous", {"orchestration": self.orchestration})
+        if pause_after:
+            self._put("transport_control_pause", {"orchestration": self.orchestration})
+        self.playback_log_offset = None
+
     def _discard_unplayed(self, name: str) -> None:
         if name not in self.owned_playlists:
             return
@@ -311,9 +357,34 @@ class RestBridge:
                 errors.append(exc)
         self.orchestration = None
         self.device = None
+        self.active_playlist = None
+        self.playback_log_offset = None
         self.window_shown = False
         if errors:
             raise RuntimeError("Bridge cleanup failed: " + "; ".join(map(str, errors)))
+
+
+def _offset_after_endpoint_marker(log_path: Path | None, pre_offset: int | None, marker: bytes) -> int | None:
+    if log_path is None or pre_offset is None:
+        return None
+    try:
+        size = log_path.stat().st_size
+        if size < pre_offset:
+            return None
+        if size == pre_offset:
+            return pre_offset
+        with log_path.open("rb") as handle:
+            handle.seek(pre_offset)
+            chunk = handle.read(size - pre_offset)
+    except OSError:
+        return None
+    pos = chunk.rfind(marker)
+    if pos == -1:
+        return pre_offset
+    newline = chunk.find(b"\n", pos)
+    if newline == -1:
+        return pre_offset
+    return pre_offset + newline + 1
 
 
 def _current_bridge_log() -> Path:
@@ -359,18 +430,27 @@ def _wait_until_showing(log_path: Path, start_offset: int, file_name: str, timeo
 class LoadingCursor:
     """反映成功後の Loading 行から、複数枚プレイリストの現在位置を追う。"""
 
-    def __init__(self, file_names: list[str], start_offset: int | None = None) -> None:
+    def __init__(
+        self,
+        file_names: list[str],
+        start_offset: int | None = None,
+        expected_index: int | None = None,
+        awaiting_seek: bool = False,
+    ) -> None:
         if len(file_names) < 2:
             raise ValueError("Loading cursor is only used for multiple images")
         self.file_names = list(file_names)
+        self.known_names = set(self.file_names)
         self.log_path = _current_bridge_log()
-        # 再生前の位置を渡されたときは先頭画像の Loading から読む。未指定時は現在位置の次、つまり2枚目から読む。
+        # 再生前の位置を渡されたときは先頭(または指定位置)の Loading から読む。未指定時は現在位置の次から読む。
         if start_offset is None:
             self.offset = self.log_path.stat().st_size
-            self.expected = 1
+            self.expected = 1 if expected_index is None else expected_index % len(self.file_names)
         else:
             self.offset = start_offset
-            self.expected = 0
+            self.expected = 0 if expected_index is None else expected_index % len(self.file_names)
+        self.awaiting_seek = awaiting_seek
+        self._seek_skips_remaining = 2 if awaiting_seek else 0
         self.pending = b""
 
     def poll(self) -> int | None:
@@ -398,9 +478,14 @@ class LoadingCursor:
             if loaded is None:
                 continue
             if loaded != self.file_names[self.expected]:
+                if self.awaiting_seek and self._seek_skips_remaining > 0 and loaded in self.known_names:
+                    self._seek_skips_remaining -= 1
+                    continue
                 raise PlaylistTrackingLost(
                     f"Bridge loaded {loaded}, which is not playlist index {self.expected}"
                 )
+            self.awaiting_seek = False
+            self._seek_skips_remaining = 0
             latest = self.expected
             self.expected = (self.expected + 1) % len(self.file_names)
         return latest
